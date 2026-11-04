@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
+import torch
+from compressed_tensors.config import SparsityCompressionConfig
+from compressed_tensors.quantization import QuantizationArgs
+import logging
+
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.quantization.base_config import (
+    LinearMethodBase,
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig, CompressedTensorsLinearMethod, CompressedTensorsKVCacheMethod
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin import CompressedTensorsMarlinMoEMethod
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer)
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+import os
+
+# if TYPE_CHECKING:
+#     from vllm.model_executor.models.utils import WeightsMapper
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["CompressedTensorsLinearMethod"]
+
+SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
+QUANTIZATION_SCHEME_MAP_TYPE = dict[str, Optional[dict[str, QuantizationArgs]]]
+
+
+class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
+    def __init__(
+        self,
+        target_scheme_map: dict[str, Any],
+        ignore: list[str],
+        quant_format: str,
+        sparsity_scheme_map: dict[str, SparsityCompressionConfig],
+        sparsity_ignore_list: list[str],
+        kv_cache_scheme: Optional[dict[str, Any]] = None,
+        config: Optional[dict[str, Any]] = None,
+        packed_modules_mapping: Optional[dict[str, list[str]]] = None,
+        linear_fp8_config: Optional[Any] = None,
+    ):
+        super().__init__(
+            target_scheme_map,
+            ignore,
+            quant_format,
+            sparsity_scheme_map,
+            sparsity_ignore_list,
+            kv_cache_scheme,
+            config,
+            packed_modules_mapping,
+            linear_fp8_config,
+        )
+
+
+    @classmethod
+    def override_quantization_method(
+            cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        if hf_quant_cfg.get("quant_method") == "compressed-tensors" \
+                and hf_quant_cfg.get("format") == "int-quantized" \
+                and user_quant == "slimquant_marlin":
+            return cls.get_name()
+        if hf_quant_cfg.get("quant_method") == "compressed-tensors" \
+                and user_quant == "slimquant_marlin":
+            logger.info(
+                "Using compressed-tensors quantization instead of "
+                "slimquant_marlin for model with format=%s.",
+                hf_quant_cfg.get("format"),
+            )
+            return "compressed-tensors"
+        return None
+    @classmethod
+    def get_name(cls) -> str:
+        return "slimquant_marlin"
+
+    def get_quant_method(
+            self,
+            layer: torch.nn.Module,
+            prefix: str,
+    ) -> Optional["QuantizeMethodBase"]:
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE  # Avoid circular import
+        from sglang.srt.layers.radix_attention import RadixAttention
+        # Check if the layer is skipped for quantization.
+        if isinstance(layer, RadixAttention):
+            if self.kv_cache_scheme is None:
+                return None
+            if not CompressedTensorsKVCacheMethod.is_supported_scheme(
+                self.kv_cache_scheme
+            ):
+                # Degrade, don't refuse to boot: unquantized-scale KV serves fine.
+                logger.warning_once(
+                    f"Ignoring compressed-tensors kv_cache_scheme "
+                    f"{self.kv_cache_scheme}: only static symmetric "
+                    f"per-tensor FP8 scales are supported."
+                )
+                return None
+            return CompressedTensorsKVCacheMethod(self)
+        if should_ignore_layer(prefix,
+                               ignore=self.ignore,
+                               fused_mapping=self.packed_modules_mapping):
+            return UnquantizedEmbeddingMethod()#UnquantizedLinearMethod()
+        if isinstance(layer, LinearBase):
+            scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
+            if scheme is None:
+                return UnquantizedEmbeddingMethod()#UnquantizedLinearMethod()
+            layer.scheme = scheme
+            return CompressedTensorsLinearMethod(self)
+        if isinstance(layer, FusedMoE):
+            # The minimax int8-marlin pack is numerically wrong for DeepSeek
+            # channel W8A8 on HCU. Use the compressed-tensors INT8 MoE path,
+            # which selects the HCU AITER/Triton kernel.
+            from sglang.srt.utils import is_hcu
+
+            use_deepgemm_marlin = (
+                get_moe_runner_backend().is_deep_gemm()
+                or get_moe_a2a_backend().is_deepep()
+            )
+            if is_hcu() and not use_deepgemm_marlin:
+                from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                    CompressedTensorsFusedMoEMethod,
+                )
+
+                layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
+                if layer.scheme is None:
+                    return UnquantizedEmbeddingMethod()
+                return CompressedTensorsFusedMoEMethod(self)
+            # DeepEP's legacy HCU W8A8 core calls DeepGEMM even when the runner
+            # backend is AUTO. Use #484's topology-aware INT8 packer for both
+            # explicit DeepGEMM and implicit DeepEP; preserve other fallbacks.
+            return CompressedTensorsMarlinMoEMethod.get_moe_method(self, layer)
+        return None

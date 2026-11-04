@@ -1,0 +1,455 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
+import torch
+import triton
+import triton.language as tl
+
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_musa, is_xpu, round_up
+
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_hcu = is_hcu()
+_is_xpu = is_xpu()
+_is_musa = is_musa()
+
+if _is_cuda or _is_hip or _is_xpu or _is_musa:
+    from sglang.kernels.ops.moe import moe_align_block_size as sgl_moe_align_block_size
+
+if _is_hcu:
+    from lightop import moe as op
+
+    # New LightOp exposes the output-buffer wrapper in its public MoE API.
+    # Keep the legacy binding when present; the native argument order is unchanged.
+    if hasattr(op, "moe_align_block_size_out"):
+        _hcu_moe_align_block_size_out = op.moe_align_block_size_out
+    else:
+        from lightop.moe import moe_align_block_size_out as _hcu_moe_align_block_size_out
+
+if _is_cuda:
+    from sglang.kernels.ops.moe.moe_align_small_numel import (
+        SMALL_NUMEL_LIMIT,
+        moe_align_small_numel,
+    )
+
+# Where the CUDA kernel's own small-batch single-block path stops: its
+# per-thread histogram costs 4 * (buckets + 1) ** 2 bytes of shared memory.
+_CUDA_SMALL_BATCH_MAX_BUCKETS = 64
+
+
+@triton.jit
+def _hcu_moe_align_stage1(
+    topk_ids_ptr,
+    tokens_cnts_ptr,
+    num_experts: tl.constexpr,
+    numel: tl.constexpr,
+    tokens_per_thread: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    start_idx = pid * tokens_per_thread
+    off_c = (pid + 1) * num_experts
+    for i in range(tokens_per_thread):
+        if start_idx + i < numel:
+            expert_id = tl.load(topk_ids_ptr + start_idx + i)
+            token_cnt = tl.load(tokens_cnts_ptr + off_c + expert_id)
+            tl.store(tokens_cnts_ptr + off_c + expert_id, token_cnt + 1)
+
+
+@triton.jit
+def _hcu_moe_align_stage2(tokens_cnts_ptr, num_experts: tl.constexpr):
+    expert_id = tl.program_id(0)
+    last_cnt = 0
+    for i in range(1, num_experts + 1):
+        token_cnt = tl.load(tokens_cnts_ptr + i * num_experts + expert_id)
+        last_cnt += token_cnt
+        tl.store(tokens_cnts_ptr + i * num_experts + expert_id, last_cnt)
+
+
+@triton.jit
+def _hcu_moe_align_stage3(
+    num_tokens_post_pad_ptr,
+    tokens_cnts_ptr,
+    cumsum_ptr,
+    num_experts: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    last_cumsum = 0
+    final_counts = num_experts * num_experts
+    for i in range(1, num_experts + 1):
+        token_cnt = tl.load(tokens_cnts_ptr + final_counts + i - 1)
+        last_cumsum += tl.cdiv(token_cnt, block_size) * block_size
+        tl.store(cumsum_ptr + i, last_cumsum)
+    tl.store(num_tokens_post_pad_ptr, last_cumsum)
+
+
+@triton.jit
+def _hcu_moe_align_stage4(
+    topk_ids_ptr,
+    sorted_ids_ptr,
+    expert_ids_ptr,
+    tokens_cnts_ptr,
+    cumsum_ptr,
+    num_experts: tl.constexpr,
+    block_size: tl.constexpr,
+    numel: tl.constexpr,
+    tokens_per_thread: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    expert_begin = tl.load(cumsum_ptr + pid)
+    expert_end = tl.load(cumsum_ptr + pid + 1)
+    for i in range(expert_begin, expert_end, block_size):
+        tl.store(expert_ids_ptr + i // block_size, pid)
+
+    token_begin = pid * tokens_per_thread
+    thread_counts = pid * num_experts
+    for i in range(token_begin, tl.minimum(token_begin + tokens_per_thread, numel)):
+        expert_id = tl.load(topk_ids_ptr + i)
+        token_cnt = tl.load(tokens_cnts_ptr + thread_counts + expert_id)
+        rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
+        tl.store(sorted_ids_ptr + rank_post_pad, i)
+        tl.store(tokens_cnts_ptr + thread_counts + expert_id, token_cnt + 1)
+
+
+def _hcu_moe_align_block_size_triton(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    """Portable HCU align which avoids LightOp's corrupt count/sort scratch."""
+    numel = topk_ids.numel()
+    tokens_per_thread = triton.cdiv(numel, num_experts)
+    tokens_cnts = torch.zeros(
+        (num_experts + 1, num_experts),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    cumsum = torch.zeros(
+        (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
+    )
+    grid = (num_experts,)
+    _hcu_moe_align_stage1[grid](
+        topk_ids, tokens_cnts, num_experts, numel, tokens_per_thread
+    )
+    _hcu_moe_align_stage2[grid](tokens_cnts, num_experts)
+    _hcu_moe_align_stage3[(1,)](
+        num_tokens_post_pad, tokens_cnts, cumsum, num_experts, block_size
+    )
+    _hcu_moe_align_stage4[grid](
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        tokens_cnts,
+        cumsum,
+        num_experts,
+        block_size,
+        numel,
+        tokens_per_thread,
+    )
+
+
+def moe_align_block_size(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    ignore_invalid_expert: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Aligns the token distribution across experts to be compatible with block
+    size for matrix multiplication.
+
+    Parameters:
+    - topk_ids: A tensor of shape [total_tokens, top_k] representing the
+        top-k expert indices for each token.
+    - block_size: The block size used in block matrix multiplication.
+    - num_experts: The total number of experts.
+
+    Returns:
+    - sorted_token_ids: A tensor containing the sorted token indices according
+        to their allocated expert.
+    - expert_ids: A tensor indicating the assigned expert index for each block.
+    - num_tokens_post_padded: The total number of tokens after padding,
+        ensuring divisibility by block_size.
+
+    This function pads the number of tokens that each expert needs to process
+    so that it is divisible by block_size.
+    Padding ensures that during block matrix multiplication, the dimensions
+    align correctly.
+
+    Example:
+    Given topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]],
+    block_size = 4, and num_experts = 4:
+    - We initially have 12 tokens (after repeating 'top_k' times) and 4 experts,
+        with each expert needing to process 3 tokens.
+    - As block_size is 4, we pad 1 token for each expert.
+    - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
+    - Then append padding tokens [12, 12, 12, 12] for each block.
+    - After sorting by expert index, we obtain token_ids
+        [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
+        Tokens 12 are non-existent (padding) and are ignored in
+        the subsequent matrix multiplication.
+    - The padding ensures that the total number of tokens is now divisible
+        by block_size for proper block matrix operations.
+    """
+    # ===== TO BE REFACTORED ====
+    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+        from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+
+        if lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get() and num_experts <= 8191:
+            from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+                _align_block_size_jit,
+            )
+
+            return _align_block_size_jit(topk_ids, block_size, num_experts)
+    # ===== END TO BE REFACTORED ====
+
+    if topk_ids.numel() < num_experts + 1:
+        max_num_tokens_padded = topk_ids.numel() * block_size
+    else:
+        max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+
+    sorted_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    )
+    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+    expert_ids = torch.empty(
+        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+
+    # In EP, expert_ids for filtered experts are -1. We have num_experts + 1 ids in total.
+    cumsum_buffer = torch.empty(
+        (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
+    )
+
+    # Tiny-batch fast path (bs=1 decode): one single-CTA triton launch replaces
+    # the generic align + count_and_sort pair, covering the corner the CUDA
+    # small-batch kernel cannot reach. Below that bucket limit the CUDA kernel
+    # is already a single launch and does O(numel) work where this one does
+    # O(numel ** 2) pairwise, so leave that side to it. ignore_invalid_expert is
+    # a different contract from the "+1 offset" convention this kernel implements.
+    if (
+        _is_cuda
+        and topk_ids.numel() <= SMALL_NUMEL_LIMIT
+        and num_experts + 1 > _CUDA_SMALL_BATCH_MAX_BUCKETS
+        and not ignore_invalid_expert
+    ):
+        moe_align_small_numel(
+            topk_ids,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+        )
+        return sorted_ids, expert_ids, num_tokens_post_pad
+
+    # ===== TO BE REFACTORED ====
+    use_jit_align = False
+    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+        from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+
+        use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
+    if _is_hcu:
+        # The sgl-kernel small-batch implementation launches 256 token
+        # threads plus one thread per expert.  With 32 EP-local experts this
+        # rounds up to 320 threads on HCU, exceeding the kernel's 256-thread
+        # launch bound and eventually causing a VMFault.
+        #
+        # StandardDispatcher represents experts owned by other EP ranks as
+        # -1.  LightOp expects non-negative ids, so route them through one
+        # extra sentinel expert and map the aligned sentinel blocks back to
+        # -1 for the Triton MoE kernel's filter_expert path.
+        invalid_expert = num_experts
+        # LightOp preserves the caller-provided padding value.  Triton masks a
+        # row only when its sorted token id is >= topk_ids.numel(); leaving the
+        # torch.empty buffer uninitialized can turn padding into real tokens.
+        sorted_ids.fill_(topk_ids.numel())
+        hcu_topk_ids = torch.where(
+            topk_ids < 0,
+            torch.full_like(topk_ids, invalid_expert),
+            topk_ids,
+        )
+        # LightOp's count/sort scratch overflows for batched decode shapes.
+        _hcu_moe_align_block_size_triton(
+            hcu_topk_ids,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+        )
+        expert_ids.masked_fill_(expert_ids == invalid_expert, -1)
+    elif use_jit_align:
+        from sglang.kernels.ops.moe.moe_align import (
+            moe_align_block_size as jit_moe_align_block_size,
+        )
+
+        jit_moe_align_block_size(
+            topk_ids,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum_buffer,
+            True,
+        )
+    # ===== END TO BE REFACTORED ====
+    else:
+        sgl_moe_align_block_size(
+            topk_ids,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum_buffer,
+            True,
+            ignore_invalid_expert,
+        )
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+def hcu_moe_align_block_size(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: Optional[torch.Tensor] = None,
+    pad_sorted_ids: bool = False,
+    num_token: Optional[int] = None,
+    expert_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Aligns the token distribution across experts to be compatible with block
+    size for matrix multiplication.
+
+    Note: In the case of expert_parallel, moe_align_block_size initially
+    considers all experts as valid and aligns all tokens appropriately.
+    Before the function returns it marks the experts_ids that are not in
+    the current GPU rank as -1 so the MoE matmuls could skip those blocks.
+    This requires the num_experts input arg to be the num global experts.
+
+    Parameters:
+    - topk_ids: A tensor of shape [total_tokens, top_k] representing the
+        top-k expert indices for each token.
+    - block_size: The block size used in block matrix multiplication.
+    - num_experts: The total number of experts.
+    - expert_map: A tensor of shape [num_experts] that maps the expert index
+        from the global space to the local index space of the current
+        expert parallel shard. If the expert is not in the current expert
+        parallel shard, the mapping is set to -1.
+    - pad_sorted_ids: A flag indicating whether the sorted_token_ids length
+      should be padded to a multiple of block_size,
+
+    Returns:
+    - sorted_token_ids: A tensor containing the sorted token indices according
+        to their allocated expert.
+    - expert_ids: A tensor indicating the assigned expert index for each block.
+    - num_tokens_post_padded: The total number of tokens after padding,
+        ensuring divisibility by block_size.
+
+    This function pads the number of tokens that each expert needs to process
+    so that it is divisible by block_size.
+    Padding ensures that during block matrix multiplication, the dimensions
+    align correctly.
+
+    Example:
+    Given topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]],
+    block_size = 4, and num_experts = 4:
+    - We initially have 12 tokens (after repeating 'top_k' times) and 4 experts,
+        with each expert needing to process 3 tokens.
+    - As block_size is 4, we pad 1 token for each expert.
+    - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
+    - Then append padding tokens [12, 12, 12, 12] for each block.
+    - After sorting by expert index, we obtain token_ids
+        [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
+        Tokens 12 are non-existent (padding) and are ignored in
+        the subsequent matrix multiplication.
+    - The padding ensures that the total number of tokens is now divisible
+        by block_size for proper block matrix operations.
+    """
+    if num_token:
+        if num_token < block_size:
+            max_num_tokens_padded = min(
+                topk_ids.numel() * block_size,
+                topk_ids.numel() + num_experts * (block_size - 1),
+            )
+        else:
+            max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+        sorted_ids = torch.full(
+            (max_num_tokens_padded,),
+            fill_value=topk_ids.numel(),
+            dtype=torch.int32,
+            device=topk_ids.device,
+        )
+    else:
+        max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+        if pad_sorted_ids:
+            max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
+        sorted_ids = torch.empty(
+            (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+        )
+    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+    if expert_map is not None:
+        expert_ids = torch.zeros(
+            (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+        )
+    else:
+        expert_ids = torch.empty(
+            (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+        )
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+
+    if expert_mask is not None:
+        _hcu_moe_align_block_size_out(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map=expert_map,
+            expert_mask=expert_mask,
+            num_local_tokens=None,
+            is_ep=False,
+            is_fuse_fill=True,
+        )
+    else:
+        _hcu_moe_align_block_size_out(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map=None,
+            expert_mask=None,
+            num_local_tokens=None,
+            is_ep=False,
+            is_fuse_fill=True,
+        )
+        if expert_map is not None:
+            expert_ids = expert_map[expert_ids]
+
+    return sorted_ids, expert_ids, num_tokens_post_pad

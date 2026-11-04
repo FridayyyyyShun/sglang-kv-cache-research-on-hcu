@@ -1,0 +1,3592 @@
+from __future__ import annotations
+
+import concurrent.futures
+import dataclasses
+import json
+
+from sglang.srt.mem_cache.cp_cache_layer_split.transfer import (
+    decode_v4_transfer_metadata, encode_v4_transfer_metadata, match_transfer_entries,
+)
+import logging
+import os
+import struct
+import threading
+import time
+from collections import defaultdict
+from typing import List, Optional, Set, Tuple, Union
+
+import numpy as np
+import numpy.typing as npt
+import zmq
+from prometheus_client import Counter
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+    CommonKVReceiver,
+    CommonKVSender,
+    KVTransferError,
+)
+from sglang.srt.disaggregation.common.staging_handler import (
+    STAGING_WATERMARK_WAIT_S,
+    DecodeStagingContext,
+    PrefillStagingContext,
+    StagingManagerMixin,
+    StagingTransferInfo,
+    handle_staging_rsp,
+    handle_watermark_msg,
+)
+from sglang.srt.disaggregation.common.utils import (
+    AuxDataCodec,
+    FastQueue,
+    TransferKVChunk,
+    build_dcp_token_transfer_plan,
+    group_concurrent_contiguous,
+    pack_int_lists,
+    pack_string_list,
+    unpack_int_lists,
+    unpack_string_list,
+)
+from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
+from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
+from sglang.srt.disaggregation.mooncake.utils import (
+    check_mooncake_custom_mem_pool_enabled,
+)
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    build_transfer_entry_pairs,
+    compute_mamba_state_slice_byte_blocks,
+    pack_state_types,
+    resolve_dcp_dst_entry_indices,
+    resolve_state_component_dst_index,
+    unpack_state_types,
+)
+from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
+from sglang.srt.environ import envs
+from sglang.srt.observability.mooncake_trace import (
+    MooncakeRequestStage,
+    mooncake_trace_func,
+    mooncake_trace_slice,
+)
+from sglang.srt.observability.trace import (
+    TraceNullContext,
+    TraceReqContext,
+    trace_set_thread_info,
+)
+from sglang.srt.runtime_context import get_memory, get_parallel, get_schedule
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_hcu
+from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.network import NetworkAddress
+
+logger = logging.getLogger(__name__)
+
+_is_hcu = is_hcu()
+_kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
+    "SGLANG_KV_LAYOUT_HCU_FA", default="true"
+)
+
+FAILED_SESSION_RECOVERIES = Counter(
+    "sglang:failed_session_recoveries_total",
+    "Number of mooncake_session_ids un-blacklisted via probe.",
+)
+
+
+# decode
+@dataclasses.dataclass
+class TransferInfo:
+    room: int
+    endpoint: str
+    dst_port: int
+    mooncake_session_id: str
+    dst_kv_indices: npt.NDArray[np.int32]
+    dst_aux_index: int
+    dst_state_indices: List[List[int]]  # parallel to receiver's state_types
+    required_dst_info_num: int
+    is_dummy: bool
+    decode_prefix_len: Optional[int] = None
+    dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    spec_metadata: Optional[dict] = None
+    # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
+    staging: Optional[StagingTransferInfo] = None
+
+    @classmethod
+    def from_zmq(cls, msg: List[bytes]):
+        if msg[4] == b"" and msg[5] == b"":
+            is_dummy = True
+            dst_kv_indices = np.array([], dtype=np.int32)
+            dst_aux_index = None
+            dst_state_indices = []
+        else:
+            dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
+            dst_aux_index = int(msg[5].decode("ascii"))
+            dst_state_indices = unpack_int_lists(msg[6], "i")
+            is_dummy = False
+        return cls(
+            room=int(msg[0].decode("ascii")),
+            endpoint=msg[1].decode("ascii"),
+            dst_port=int(msg[2].decode("ascii")),
+            mooncake_session_id=msg[3].decode("ascii"),
+            dst_kv_indices=dst_kv_indices,
+            dst_aux_index=dst_aux_index,
+            dst_state_indices=dst_state_indices,
+            required_dst_info_num=int(msg[7].decode("ascii")),
+            is_dummy=is_dummy,
+            decode_prefix_len=(
+                int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+            ),
+            dst_device_kv_indices=(
+                np.frombuffer(msg[9], dtype=np.int32)
+                if len(msg) > 9 and msg[9] != b""
+                else None
+            ),
+            spec_metadata=(
+                json.loads(msg[10].decode("utf-8"))
+                if len(msg) > 10 and msg[10] != b""
+                else None
+            ),
+        )
+
+
+# decode
+@dataclasses.dataclass
+class KVArgsRegisterInfo:
+    room: str
+    endpoint: str
+    dst_port: int
+    mooncake_session_id: str
+    dst_kv_ptrs: list[int]
+    dst_aux_ptrs: list[int]
+    dst_state_data_ptrs: List[List[int]]  # parallel to state_types (same below)
+    dst_tp_rank: int
+    dst_attn_tp_size: int
+    dst_kv_item_len: int
+    # for mamba state different tp slice transfer
+    dst_state_item_lens: List[List[int]]
+    dst_state_dim_per_tensor: List[List[int]]
+    dst_kv_layer_ids: List[int]
+    dst_state_layer_ids: List[List[int]]
+    dst_state_types: List[StateType] = dataclasses.field(default_factory=list)
+    dst_state_data_formats: List[str] = dataclasses.field(default_factory=list)
+    # Local-only validation result; this is never serialized on the wire.
+    registration_error: Optional[str] = dataclasses.field(default=None, repr=False)
+    dst_dcp_size: int = 1
+    dst_dcp_rank: int = 0
+    requires_dcp_relayout: bool = False
+    dcp_token_item_lens: Optional[List[int]] = None
+    staging_base_ptr: int = 0
+    staging_total_size: int = 0
+    v4_transfer_metadata: dict = dataclasses.field(default_factory=dict)
+
+    @classmethod
+    def from_zmq(cls, msg: List[bytes]):
+        return cls(
+            room=str(msg[0].decode("ascii")),
+            endpoint=msg[1].decode("ascii"),
+            dst_port=int(msg[2].decode("ascii")),
+            mooncake_session_id=msg[3].decode("ascii"),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
+            dst_tp_rank=int(msg[7].decode("ascii")),
+            dst_attn_tp_size=int(msg[8].decode("ascii")),
+            dst_kv_item_len=int(msg[9].decode("ascii")),
+            dst_state_item_lens=(
+                unpack_int_lists(msg[10], "I") if len(msg) > 10 else []
+            ),
+            dst_state_dim_per_tensor=(
+                unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
+            ),
+            dst_kv_layer_ids=(
+                list(struct.unpack(f"{len(msg[12]) // 4}I", msg[12]))
+                if len(msg) > 12 and msg[12] != b""
+                else []
+            ),
+            dst_state_layer_ids=(
+                unpack_int_lists(msg[13], "I")
+                if len(msg) > 13 and msg[13] != b""
+                else []
+            ),
+            dst_state_data_formats=(
+                unpack_string_list(msg[18]) if len(msg) > 18 and msg[18] != b"" else []
+            ),
+            dst_state_types=unpack_state_types(msg[19]) if len(msg) > 19 else [],
+            v4_transfer_metadata=decode_v4_transfer_metadata(msg),
+            staging_base_ptr=(
+                struct.unpack("Q", msg[14])[0]
+                if len(msg) > 14 and len(msg[14]) == 8
+                else 0
+            ),
+            staging_total_size=(
+                int(msg[15].decode("ascii")) if len(msg) > 15 and msg[15] != b"" else 0
+            ),
+            dst_dcp_size=(
+                int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 1
+            ),
+            dst_dcp_rank=(
+                int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
+            ),
+        )
+
+
+class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
+    AUX_DATA_HEADER = b"AUX_DATA"
+    PD_HIDDEN_CHUNK_READY_HEADER = b"PD_HIDDEN_CHUNK_READY"
+    PD_HIDDEN_CHUNK_ACK_HEADER = b"PD_HIDDEN_CHUNK_ACK"
+
+    def __init__(
+        self,
+        args: KVArgs,
+        disaggregation_mode: DisaggregationMode,
+        server_args: ServerArgs,
+        is_mla_backend: Optional[bool] = False,
+    ):
+        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.init_engine()
+        self.register_buffer_to_engine()
+        self.pd_hidden_pool = None
+        self.pd_hidden_events = PDHiddenEventManager(self)
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_trace = server_args.enable_trace
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.session_failures = defaultdict(int)
+            self.failed_sessions = set()
+            # Per-room count of chunks not yet transferred; teardown waits for
+            # zero so a deferred chunk is not dropped by an early conclude.
+            self._staging_outstanding = defaultdict(int)
+            self._source_drain = SourceDrainTracker()
+            self.session_lock = threading.Lock()
+            self._transfer_completion_condition = threading.Condition()
+            self.pd_hidden_events.init_prefill_state()
+            # Determine the number of threads to use for kv sender
+            cpu_count = os.cpu_count()
+            transfer_thread_pool_size = (
+                envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.get()
+            )
+            if transfer_thread_pool_size is None:
+                transfer_thread_pool_size = min(max(4, int(0.5 * cpu_count) // 8), 12)
+            transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+            self.transfer_queues: List[FastQueue] = [
+                FastQueue() for _ in range(transfer_queue_size)
+            ]
+            assert transfer_thread_pool_size >= transfer_queue_size, (
+                f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
+                f"greater than or equal to SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
+            )
+            self.executors = [
+                concurrent.futures.ThreadPoolExecutor(
+                    transfer_thread_pool_size // transfer_queue_size
+                )
+                for _ in range(transfer_queue_size)
+            ]
+            self.enable_custom_mem_pool, self.custom_mem_pool_type = (
+                check_mooncake_custom_mem_pool_enabled()
+            )
+            self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
+            if self.enable_staging:
+                self._init_staging_buffers(len(self.transfer_queues))
+            for i, (transfer_queue, executor) in enumerate(
+                zip(self.transfer_queues, self.executors)
+            ):
+                threading.Thread(
+                    target=self.transfer_worker,
+                    args=(
+                        transfer_queue,
+                        executor,
+                        (
+                            self._staging_ctx.buffers[i]
+                            if self.enable_staging and self._staging_ctx.buffers
+                            else None
+                        ),
+                        i,
+                    ),
+                    daemon=True,
+                ).start()
+            self.enable_failed_session_probe = (
+                envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
+            )
+            if self.enable_failed_session_probe:
+                self.failed_session_probe_interval = (
+                    envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
+                )
+                self._failed_session_probe_shutdown = threading.Event()
+                threading.Thread(
+                    target=self._failed_session_probe_loop,
+                    name="MooncakeFailedSessionProbe",
+                    daemon=True,
+                ).start()
+            self.start_prefill_thread()
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.pd_hidden_events.init_decode_state()
+            self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
+            if self.enable_staging:
+                self._init_staging_allocator()
+                self._staging_handler = None
+            self.start_decode_thread()
+
+    def supports_pd_hidden_streaming(self) -> bool:
+        return self.pd_hidden_events.supports_streaming()
+
+    def mark_pd_hidden_request_done(
+        self,
+        bootstrap_room: int,
+        state_indices: Optional[List] = None,
+    ) -> None:
+        self.pd_hidden_events.mark_request_done(
+            bootstrap_room,
+            state_indices,
+        )
+
+    def pop_pd_hidden_request_done(self, bootstrap_room: int) -> bool:
+        return self.pd_hidden_events.pop_request_done(bootstrap_room)
+
+    def mark_pd_hidden_done(
+        self,
+        bootstrap_room: int,
+        state_indices: Optional[List] = None,
+    ) -> None:
+        self.mark_pd_hidden_request_done(bootstrap_room, state_indices)
+
+    def pop_pd_hidden_done(self, bootstrap_room: int) -> bool:
+        return self.pop_pd_hidden_request_done(bootstrap_room)
+
+    def park_pd_hidden_chunk_for_ack(
+        self,
+        *,
+        transfer_queue: FastQueue,
+        kv_chunk: TransferKVChunk,
+        prefill_rank: int,
+        expected_count: int,
+        timeout_s: float = 300.0,
+    ) -> bool:
+        return self.pd_hidden_events.park_chunk_for_ack(
+            transfer_queue=transfer_queue,
+            kv_chunk=kv_chunk,
+            prefill_rank=prefill_rank,
+            expected_count=expected_count,
+            timeout_s=timeout_s,
+        )
+
+    def _wake_pd_hidden_ack_waiters(self, room: int) -> None:
+        self.pd_hidden_events.wake_ack_waiters(room)
+
+    def _park_pd_hidden_chunk_behind_room(
+        self, transfer_queue: FastQueue, kv_chunk: TransferKVChunk
+    ) -> None:
+        self.pd_hidden_events.park_chunk_behind_room(transfer_queue, kv_chunk)
+
+    def _wake_next_pd_hidden_room_waiter(self, room: int) -> None:
+        self.pd_hidden_events.wake_next_room_waiter(room)
+
+    def _handle_pd_hidden_chunk_ack(
+        self, room: int, prefill_rank: int, hidden_start: int
+    ) -> None:
+        self.pd_hidden_events.handle_chunk_ack(room, prefill_rank, hidden_start)
+
+    def pop_pd_hidden_ready_chunks(self, room: int) -> List[dict]:
+        return self.pd_hidden_events.pop_ready_chunks(room)
+
+    def submit_pd_hidden_chunk_ack(
+        self,
+        *,
+        event,
+        remote: str,
+        dst_port: int,
+        room: int,
+        prefill_rank: int,
+        hidden_start: int,
+        is_last_hidden_chunk: bool,
+    ) -> None:
+        self.pd_hidden_events.submit_chunk_ack(
+            event=event,
+            remote=remote,
+            dst_port=dst_port,
+            room=room,
+            prefill_rank=prefill_rank,
+            hidden_start=hidden_start,
+            is_last_hidden_chunk=is_last_hidden_chunk,
+        )
+
+    def _drain_pd_hidden_ack_completions(self) -> None:
+        self.pd_hidden_events.drain_ack_completions()
+
+    def pop_pd_hidden_acked_chunks(self, room: int) -> List[dict]:
+        return self.pd_hidden_events.pop_acked_chunks(room)
+
+    def wait_pd_hidden_ack_completions(
+        self, room: int, timeout_s: float = 300.0
+    ) -> bool:
+        return self.pd_hidden_events.wait_ack_completions(room, timeout_s)
+
+    def _begin_pd_hidden_transfer(self, room: int) -> None:
+        self.pd_hidden_events.begin_transfer(room)
+
+    def _end_pd_hidden_transfer(self, room: int) -> None:
+        self.pd_hidden_events.end_transfer(room)
+
+    def _wait_pd_hidden_transfers_quiesced(
+        self, room: int, timeout_s: float = 300.0
+    ) -> bool:
+        return self.pd_hidden_events.wait_transfers_quiesced(room, timeout_s)
+
+    def _pd_hidden_state_index(self) -> Optional[int]:
+        return self.pd_hidden_events.state_index()
+
+    def _has_pd_hidden_state(self, state_indices: Optional[List]) -> bool:
+        return self.pd_hidden_events.has_state(state_indices)
+
+    def _without_pd_hidden_state(
+        self, state_indices: Optional[List]
+    ) -> Optional[List]:
+        return self.pd_hidden_events.without_state(state_indices)
+
+    def _pd_hidden_release_state_indices(
+        self, kv_chunk: TransferKVChunk
+    ) -> Optional[List]:
+        return self.pd_hidden_events.release_state_indices(kv_chunk)
+
+    def _free_pd_hidden_state_indices(self, state_indices: Optional[List]) -> None:
+        self.pd_hidden_events.free_state_indices(state_indices)
+
+    def _free_pd_hidden_chunk_rows(self, kv_chunk: TransferKVChunk) -> None:
+        self.pd_hidden_events.free_chunk_rows(kv_chunk)
+
+    def _release_or_mark_pd_hidden_done(self, kv_chunk: TransferKVChunk) -> None:
+        self.pd_hidden_events.release_or_mark_done(kv_chunk)
+
+    def _finish_pd_hidden_streaming_chunk(
+        self,
+        kv_chunk: TransferKVChunk,
+        hidden_inflight_key: Optional[Tuple[int, int]],
+    ) -> None:
+        self.pd_hidden_events.finish_streaming_chunk(kv_chunk, hidden_inflight_key)
+
+    def _mark_session_failed_and_sync(
+        self,
+        *,
+        kv_chunk: TransferKVChunk,
+        req: TransferInfo,
+        prefill_unique_rank: int,
+        failure_reason: str,
+    ) -> None:
+        self.pd_hidden_events.mark_session_failed_and_sync(
+            kv_chunk=kv_chunk,
+            req=req,
+            prefill_unique_rank=prefill_unique_rank,
+            failure_reason=failure_reason,
+        )
+
+    def notify_pd_hidden_chunk_ready(
+        self,
+        *,
+        remote: str,
+        dst_port: int,
+        room: int,
+        prefill_rank: int,
+        hidden_start: int,
+        row_len: int,
+        is_last_hidden_chunk: bool,
+        dst_indices: List[int],
+    ) -> None:
+        na = NetworkAddress(remote, dst_port)
+        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+            [
+                self.PD_HIDDEN_CHUNK_READY_HEADER,
+                str(room).encode("ascii"),
+                str(prefill_rank).encode("ascii"),
+                str(hidden_start).encode("ascii"),
+                str(row_len).encode("ascii"),
+                b"1" if is_last_hidden_chunk else b"0",
+                struct.pack(f"<{len(dst_indices)}i", *[int(x) for x in dst_indices])
+                if dst_indices
+                else b"",
+                self.local_ip.encode("ascii"),
+                str(self.rank_port).encode("ascii"),
+            ]
+        )
+
+    def ack_pd_hidden_chunk(
+        self,
+        *,
+        remote: str,
+        dst_port: int,
+        room: int,
+        prefill_rank: int,
+        hidden_start: int,
+    ) -> None:
+        na = NetworkAddress(remote, dst_port)
+        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+            [
+                self.PD_HIDDEN_CHUNK_ACK_HEADER,
+                str(room).encode("ascii"),
+                str(prefill_rank).encode("ascii"),
+                str(hidden_start).encode("ascii"),
+            ]
+        )
+
+    def _notify_transfer_waiters(self) -> None:
+        condition = getattr(self, "_transfer_completion_condition", None)
+        if condition is not None:
+            with condition:
+                condition.notify_all()
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        super().update_status(bootstrap_room, status)
+        if status in (KVPoll.Success, KVPoll.Failed):
+            self._notify_transfer_waiters()
+
+    def wait_for_transfer_rooms(
+        self, bootstrap_rooms: Set[int], timeout_s: float
+    ) -> bool:
+        """Wait briefly for final rooms so the scheduler can poll before forward."""
+        if not bootstrap_rooms or timeout_s <= 0:
+            return False
+
+        def all_terminal() -> bool:
+            # Mirror MooncakeKVSender.poll(): Success is set before the worker
+            # finishes the chunk, so it only counts once nothing is outstanding.
+            for room in bootstrap_rooms:
+                status = self.request_status.get(room)
+                if status not in (None, KVPoll.Success, KVPoll.Failed):
+                    return False
+                if (
+                    status == KVPoll.Success
+                    and self._staging_outstanding.get(room, 0) > 0
+                ):
+                    return False
+            return True
+
+        with self._transfer_completion_condition:
+            return self._transfer_completion_condition.wait_for(
+                all_terminal, timeout=timeout_s
+            )
+
+    def init_engine(self):
+        self.engine = get_mooncake_transfer_engine()
+
+    def _registerable_regions(self) -> List[Tuple[int, int]]:
+        """(ptr, len) regions to (de)register, exact duplicates removed.
+
+        Deduped because the unified memory pool reports one raw buffer as both
+        its KV and its mamba state component, and double registration fails in
+        the engine.
+        """
+        regions: List[Tuple[int, int]] = []
+        seen: Set[Tuple[int, int]] = set()
+
+        def add(ptrs: List[int], lens: List[int]) -> None:
+            for ptr, length in zip(ptrs or [], lens or []):
+                if (ptr, length) not in seen:
+                    seen.add((ptr, length))
+                    regions.append((ptr, length))
+
+        add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        add(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens)
+        for ptrs, lens in zip(
+            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+        ):
+            add(ptrs, lens)
+        return regions
+
+    def register_buffer_to_engine(self):
+        regions = self._registerable_regions()
+        if regions:
+            ptrs, lens = zip(*regions)
+            self.engine.batch_register(list(ptrs), list(lens))
+
+    def deregister_buffer_to_engine(self):
+        regions = self._registerable_regions()
+        if regions:
+            ptrs, _ = zip(*regions)
+            self.engine.batch_deregister(list(ptrs))
+
+        if hasattr(self, "connection_pool"):
+            with self.connection_lock:
+                self.connection_pool.clear()
+
+    # ------------------------------------------------------------------
+    # Staging buffer methods (all delegate to staging_handler.py)
+    # ------------------------------------------------------------------
+
+    def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
+        self._staging_ctx.room_bootstrap[room] = bootstrap_infos
+        self._staging_ctx.room_receivers[room] = receiver
+
+    def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
+        self.kv_buffer_tensors = {
+            "k_buffers": k_buffers,
+            "v_buffers": v_buffers,
+            "page_size": page_size,
+        }
+
+    def _init_staging_buffers(self, count: int):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            init_staging_buffers,
+        )
+
+        self._staging_ctx.buffers = init_staging_buffers(
+            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self.kv_args,
+            count,
+            get_schedule().chunked_prefill_size,
+        )
+        self.kv_buffer_tensors = None
+
+    def _init_staging_allocator(self):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            init_staging_allocator,
+        )
+
+        self._staging_ctx.allocator = init_staging_allocator(
+            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self.kv_args,
+        )
+        self.kv_buffer_tensors = None
+
+    def _try_create_staging_strategy(self, staging_buffer):
+        if not self.enable_staging or self.kv_buffer_tensors is None:
+            return None
+        from sglang.srt.disaggregation.common.staging_handler import (
+            PrefillStagingStrategy,
+        )
+
+        return PrefillStagingStrategy(self, staging_buffer)
+
+    def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
+        """Notify decode that a staging chunk RDMA is complete (every chunk;
+        scatter is arrival-driven)."""
+        na = NetworkAddress(req.endpoint, req.dst_port)
+        self._send_multipart_locked(
+            na.to_tcp(),
+            [
+                b"CHUNK_READY",
+                str(req.room).encode("ascii"),
+                str(chunk_idx).encode("ascii"),
+                str(kv_chunk.index_slice.start).encode("ascii"),
+                str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                req.mooncake_session_id.encode("ascii"),
+                str(prefill_unique_rank).encode("ascii"),
+            ],
+            is_ipv6=na.is_ipv6,
+        )
+
+    def _do_staging_transfer(
+        self,
+        staging_strategy,
+        kv_chunk,
+        req,
+        target_info,
+        chunked_dst_kv_indice,
+        executor,
+        queue,
+        prefill_unique_rank,
+    ):
+        """Execute staging transfer for one chunk. Returns (ret, deferred).
+
+        Handles readiness check, transfer, and CHUNK_READY notification; a chunk
+        that cannot fit returns -1 (the caller fails only this room) instead of
+        falling back to the slice path, which would leak the decode-side
+        allocation. deferred=True means caller should re-enqueue and break.
+        """
+        ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
+            req,
+            kv_chunk.index_slice.start,
+            len(kv_chunk.prefill_kv_indices),
+        )
+        if not ready:
+            from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
+
+            if c_offset == StagingAllocator.ALLOC_OVERSIZED:
+                # Fail this room, not the worker thread: the same prefill still
+                # serves other (same-TP, non-staging) decode instances.
+                logger.warning_once(
+                    "[Staging] a chunk exceeds the staging ring; failing affected "
+                    "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
+                    "reduce chunked_prefill_size."
+                )
+                return (-1, False)
+            # Not ready yet: wait (bounded) for a watermark advance, then
+            # re-enqueue to retry. A plain block-until-ready would head-of-line
+            # block other rooms on this single worker thread.
+            with self._staging_ctx.watermark_cv:
+                self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
+            queue.put(kv_chunk)
+            return (-1, True)
+
+        ret = staging_strategy.transfer(
+            req.mooncake_session_id,
+            kv_chunk.prefill_kv_indices,
+            target_info.staging_base_ptr + c_offset,
+            target_info.staging_total_size - c_offset,
+            target_info,
+        )
+        if ret == -1:
+            # Doesn't fit the ring: fail this room (caller's ret != 0 path), do
+            # not fall back to the slice path (leaks the decode-side allocation).
+            logger.warning_once(
+                "[Staging] a chunk does not fit the staging ring; failing affected "
+                "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
+                "reduce chunked_prefill_size."
+            )
+            return (-1, False)
+        if ret == 0:
+            self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
+        return (ret, False)
+
+    def _prefetch_staging_reqs(self, room: int):
+        if not self.enable_staging or self.kv_buffer_tensors is None:
+            return
+
+        room_infos = self.transfer_infos.get(room, {})
+        needs_staging = any(
+            not tinfo.is_dummy
+            and self.decode_kv_args_table.get(tinfo.mooncake_session_id) is not None
+            and self.decode_kv_args_table[tinfo.mooncake_session_id].dst_attn_tp_size
+            != self.attn_tp_size
+            for tinfo in room_infos.values()
+        )
+        if not needs_staging:
+            return
+
+        from sglang.srt.disaggregation.common.staging_handler import (
+            prefetch_staging_reqs,
+        )
+
+        prefetch_staging_reqs(
+            room,
+            self.transfer_infos,
+            self.kv_buffer_tensors,
+            get_schedule().chunked_prefill_size,
+            self._staging_ctx.prefetch_requested,
+            self._staging_ctx.prefetch_sockets,
+            requester_pp_rank=self.pp_rank,
+        )
+
+    def send_kvcache_staged(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_staging_ptr: int,
+        dst_staging_size: int,
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        dst_kv_item_len: int,
+        dst_layer_ids: List[int],
+        staging_buffer=None,
+    ) -> int:
+        """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+            compute_staging_layout,
+            resolve_total_kv_heads,
+        )
+
+        if self.kv_buffer_tensors is None or staging_buffer is None:
+            return -1
+
+        k_buffers = self.kv_buffer_tensors["k_buffers"]
+        v_buffers = self.kv_buffer_tensors["v_buffers"]
+        page_size = self.kv_buffer_tensors["page_size"]
+        num_layers = len(k_buffers)
+        head_dim = k_buffers[0].shape[-1]
+        dtype_size = k_buffers[0].element_size()
+
+        total_kv_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
+
+        local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+        src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
+            self.attn_tp_size,
+            dst_attn_tp_size,
+            local_tp_rank,
+            dst_tp_rank,
+            total_kv_heads,
+        )
+
+        num_tokens = len(prefill_kv_indices) * page_size
+        per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
+        local_bytes = per_layer_bytes * num_layers * 2
+
+        if self.pp_size > 1:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                dst_layer_ids,
+                num_layers * 2,
+                len(dst_layer_ids),
+            )
+            dst_num_layers = len(dst_layer_ids) // 2
+        else:
+            pairs = None
+            dst_num_layers = num_layers
+
+        num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
+            self.attn_tp_size,
+            dst_attn_tp_size,
+            dst_tp_rank,
+            total_kv_heads,
+            num_tokens,
+            head_dim * dtype_size,
+            dst_num_layers,
+        )
+        writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
+        rank_offset = sum(writer_rank_bytes[:writer_idx])
+
+        if not staging_buffer.fits(local_bytes):
+            logger.warning(
+                f"Prefill staging too small for {local_bytes} bytes, falling back"
+            )
+            return -1
+        if dst_staging_size < total_staging_needed:
+            logger.warning(
+                f"Decode staging too small: need {total_staging_needed} bytes "
+                f"for {dst_num_layers} layers, have {dst_staging_size}, falling back"
+            )
+            return -1
+
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            gather_all_layers_to_staging,
+        )
+
+        gather_all_layers_to_staging(
+            k_buffers,
+            v_buffers,
+            prefill_kv_indices,
+            staging_buffer,
+            src_head_start,
+            num_heads_to_send,
+            page_size,
+            self.kv_args.gpu_id,
+        )
+
+        if pairs is None:
+            transfer_blocks = [
+                (
+                    staging_buffer.get_ptr(),
+                    dst_staging_ptr + rank_offset,
+                    local_bytes,
+                )
+            ]
+        else:
+            transfer_blocks = [
+                (
+                    staging_buffer.get_ptr() + src_idx * per_layer_bytes,
+                    dst_staging_ptr + rank_offset + dst_idx * per_layer_bytes,
+                    per_layer_bytes,
+                )
+                for src_idx, dst_idx in pairs
+            ]
+        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
+        if ret != 0:
+            raise RuntimeError(
+                f"[Staging] Bulk RDMA transfer failed with ret={ret}. "
+                f"src_ptr=0x{staging_buffer.get_ptr():x}, "
+                f"dst_ptr=0x{dst_staging_ptr + rank_offset:x}, size={local_bytes}. "
+                f"The decode staging buffer may not be properly registered."
+            )
+        return ret
+
+    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+        if not transfer_blocks:
+            return 0
+
+        src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+        return self.engine.batch_transfer_sync(
+            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+        )
+
+    def _send_kvcache_generic(
+        self,
+        mooncake_session_id: str,
+        src_data_ptrs: list[int],
+        dst_data_ptrs: list[int],
+        item_lens: list[int],
+        prefill_data_indices: npt.NDArray[np.int32],
+        dst_data_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        state_type: Optional[StateType] = None,
+        force_flat: bool = False,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
+        dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_device_data_ptrs: Optional[set[int]] = None,
+        src_layout=None,
+        dst_layout=None,
+        dst_item_lens=None,
+    ) -> int:
+        """
+        Generic KV cache transfer supporting both MHA and MLA architectures.
+        This method is used by both send_kvcache (full pool) and maybe_send_extra.
+
+        ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
+        even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
+        index) whose per-layer list must not be half-split into K/V.
+        """
+        # Host and device buffers may use different destination page spaces.
+        # Build both transfer plans once, then select per destination buffer.
+        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+            prefill_data_indices, dst_data_indices
+        )
+        device_prefill_kv_blocks = device_dst_kv_blocks = None
+        if dst_device_data_indices is not None:
+            device_prefill_kv_blocks, device_dst_kv_blocks = (
+                group_concurrent_contiguous(
+                    prefill_data_indices, dst_device_data_indices
+                )
+            )
+
+        layers_params = None
+
+        # Only the opt-in LayerSplit sender consumes descriptor metadata.
+        if getattr(self, "cp_cache_layer_split", False):
+            pairs = match_transfer_entries(src_layout or [], dst_layout or [], item_lens, dst_item_lens or [])
+            layers_params = [(src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs]
+        # Decode pp size should be equal to prefill pp size or 1
+        elif self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
+            # Layer IDs map PP-local buffers to global decode entries.
+            # Registrations without them retain the existing PP mapping.
+            if src_layer_ids or dst_layer_ids:
+                pairs = build_transfer_entry_pairs(
+                    src_layer_ids,
+                    dst_layer_ids,
+                    len(src_data_ptrs),
+                    len(dst_data_ptrs),
+                    allow_positional_fallback=self.pp_size == 1,
+                )
+                layers_params = [
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
+                ]
+            else:
+                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(
+                        src_data_ptrs, dst_data_ptrs, state_type
+                    )
+                )
+                layers_params = [
+                    (
+                        src_kv_ptrs[layer_id],
+                        dst_kv_ptrs[layer_id],
+                        item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+            )
+            # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
+            # Use correct item lengths for K and V separately
+            if layers_current_pp_stage > len(dst_k_ptrs):
+                logger.error(
+                    "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
+                    f"layers_current_pp_stage={layers_current_pp_stage}, len(dst_k_ptrs)={len(dst_k_ptrs)}"
+                )
+                return -1
+            layers_params = [
+                (
+                    src_k_ptrs[layer_id],
+                    dst_k_ptrs[layer_id],
+                    item_lens[layer_id],  # K item length
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ] + [
+                (
+                    src_v_ptrs[layer_id],
+                    dst_v_ptrs[layer_id],
+                    item_lens[layers_current_pp_stage + layer_id],  # V item length
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
+        assert layers_params is not None
+
+        def set_transfer_blocks(
+            src_ptr: int, dst_ptr: int, item_len: int
+        ) -> List[Tuple[int, int, int]]:
+            transfer_blocks = []
+            if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
+                assert (
+                    device_prefill_kv_blocks is not None
+                    and device_dst_kv_blocks is not None
+                )
+                src_blocks, dst_blocks = (
+                    device_prefill_kv_blocks,
+                    device_dst_kv_blocks,
+                )
+            else:
+                src_blocks, dst_blocks = prefill_kv_blocks, dst_kv_blocks
+            for prefill_index, decode_index in zip(src_blocks, dst_blocks):
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                length = item_len * len(prefill_index)
+                transfer_blocks.append((src_addr, dst_addr, length))
+            return transfer_blocks
+
+        # Worker function for processing a single layer
+        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+        # Worker function for processing all layers in a batch
+        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
+            transfer_blocks = []
+            for src_ptr, dst_ptr, item_len in layers_params:
+                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+        if self.enable_custom_mem_pool:
+            futures = [
+                executor.submit(
+                    process_layer,
+                    src_ptr,
+                    dst_ptr,
+                    item_len,
+                )
+                for (src_ptr, dst_ptr, item_len) in layers_params
+            ]
+            return self._await_transfer_futures(futures)
+        else:
+            # Combining all layers' params in one batch transfer is more efficient
+            # compared to using multiple threads
+            return process_layers(layers_params)
+
+    def _validate_envelope_kv_layout(
+        self,
+        dst_kv_ptrs: list[int],
+        dst_kv_item_len: Optional[int],
+        dst_attn_tp_size: Optional[int] = None,
+    ) -> None:
+        """Reject a peer whose KV registration shape differs from ours.
+
+        The unified memory pool registers ONE whole-envelope region and
+        addresses the destination as ``dst_ptr + page_id * item_len`` using OUR
+        ``item_len``, so a peer on a different page size / spec, or without
+        unified memory, would take envelope-sized blocks at the wrong offsets.
+        Must run before the first RDMA write.
+
+        Scoped to unified memory by config, not by region count: a non-unified
+        PP stage owning a single full-attention layer also registers one region,
+        and `_send_kvcache_generic` pairs that with the peer by layer id.
+        """
+        if not get_memory().enable_unified_memory:
+            return
+        if dst_attn_tp_size is not None and self.attn_tp_size != dst_attn_tp_size:
+            # The unified mamba state ships as one whole-slot envelope with no
+            # per-tensor dims, so `_send_mamba_state_slice` cannot reslice it and
+            # silently falls back to an unsliced copy. Reject here, before any KV
+            # is written, rather than in `maybe_send_extra` afterwards.
+            raise RuntimeError(
+                "--enable-unified-memory does not support different prefill / "
+                f"decode attention TP sizes (prefill={self.attn_tp_size}, "
+                f"decode={dst_attn_tp_size}): the whole-envelope state cannot "
+                "be TP-resliced."
+            )
+        src_item_lens = self.kv_args.kv_item_lens
+        if (
+            len(src_item_lens) != 1
+            or len(dst_kv_ptrs) != 1
+            or dst_kv_item_len is None
+            or src_item_lens[0] != dst_kv_item_len
+        ):
+            raise RuntimeError(
+                "PD KV layout mismatch on the whole-envelope path: prefill has "
+                f"{len(src_item_lens)} KV region(s) with item_lens="
+                f"{src_item_lens}, decode has {len(dst_kv_ptrs)} with item_len="
+                f"{dst_kv_item_len}. With --enable-unified-memory both sides "
+                "must enable it and use the same page size and model spec."
+            )
+
+    def _await_transfer_futures(self, futures) -> int:
+        """Drain every submitted write, including after failure or cancellation."""
+        futures = tuple(futures)
+        ret = 0
+        first_exception = None
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                status = future.result()
+            except concurrent.futures.CancelledError:
+                continue
+            except Exception as exc:
+                if first_exception is None:
+                    first_exception = exc
+                for other in futures:
+                    other.cancel()
+                continue
+            if status != 0 and ret == 0:
+                ret = status
+                for other in futures:
+                    other.cancel()
+        if first_exception is not None:
+            raise first_exception
+        return ret
+
+    def send_kvcache(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: Optional[List[int]] = None,
+        dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_kv_item_len: Optional[int] = None,
+        dst_attn_tp_size: Optional[int] = None,
+        v4_transfer_metadata=None,
+    ):
+        self._validate_envelope_kv_layout(
+            dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
+        )
+        dst_device_kv_ptrs = None
+        if dst_device_kv_indices is not None:
+            compression_ratios = self.kv_args.mla_compression_ratios
+            assert compression_ratios is not None
+            if len(dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs):
+                start = self.kv_args.prefill_start_layer
+                end = self.kv_args.prefill_end_layer
+                assert end is not None
+                compression_ratios = compression_ratios[start:end]
+            c4_layer_num = sum(ratio == 4 for ratio in compression_ratios)
+            dst_device_kv_ptrs = set(dst_kv_ptrs[c4_layer_num:])
+        return self._send_kvcache_generic(
+            mooncake_session_id=mooncake_session_id,
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            dst_data_ptrs=dst_kv_ptrs,
+            item_lens=self.kv_args.kv_item_lens,
+            prefill_data_indices=prefill_kv_indices,
+            dst_data_indices=dst_kv_indices,
+            executor=executor,
+            src_layer_ids=self.kv_args.kv_layer_ids,
+            dst_layer_ids=dst_layer_ids,
+            dst_device_data_indices=dst_device_kv_indices,
+            dst_device_data_ptrs=dst_device_kv_ptrs,
+            src_layout=getattr(self.kv_args, "v4_transfer_metadata", {}).get("kv"),
+            dst_layout=(v4_transfer_metadata or {}).get("kv"),
+            dst_item_lens=(v4_transfer_metadata or {}).get("kv_sizes"),
+        )
+
+    def send_kvcache_dcp(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        dcp_token_item_lens: List[int],
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: List[int],
+    ) -> int:
+        if num_kv_tokens is None:
+            raise ValueError("PD DCP transfer requires num_kv_tokens")
+        physical_page_size = self.kv_args.page_size
+        plan = build_dcp_token_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=physical_page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+        if plan.src_token_indices.size == 0:
+            return 0
+
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if src_layer_ids or dst_layer_ids:
+            dst_indices = resolve_dcp_dst_entry_indices(
+                src_layer_ids,
+                dst_layer_ids,
+                len(self.kv_args.kv_data_ptrs),
+                len(dst_kv_ptrs),
+            )
+            src_kv_ptrs = self.kv_args.kv_data_ptrs
+            dst_kv_ptrs = [dst_kv_ptrs[j] for j in dst_indices]
+        else:
+            src_kv_ptrs, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+                self.kv_args.kv_data_ptrs,
+                dst_kv_ptrs,
+            )
+        layers_current_pp_stage = len(src_kv_ptrs)
+        src_groups, dst_groups = group_concurrent_contiguous(
+            plan.src_token_indices,
+            plan.dst_token_indices,
+        )
+
+        layers_params = [
+            (
+                src_kv_ptrs[layer_id],
+                dst_kv_ptrs[layer_id],
+                dcp_token_item_lens[layer_id],
+            )
+            for layer_id in range(layers_current_pp_stage)
+        ]
+
+        def set_transfer_blocks(
+            src_ptr: int, dst_ptr: int, token_item_len: int
+        ) -> List[Tuple[int, int, int]]:
+            return [
+                (
+                    src_ptr + int(src_group[0]) * token_item_len,
+                    dst_ptr + int(dst_group[0]) * token_item_len,
+                    len(src_group) * token_item_len,
+                )
+                for src_group, dst_group in zip(src_groups, dst_groups)
+            ]
+
+        def process_layer(src_ptr: int, dst_ptr: int, token_item_len: int) -> int:
+            return self._transfer_data(
+                mooncake_session_id,
+                set_transfer_blocks(src_ptr, dst_ptr, token_item_len),
+            )
+
+        if self.enable_custom_mem_pool:
+            futures = [
+                executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
+                for src_ptr, dst_ptr, token_item_len in layers_params
+            ]
+            return self._await_transfer_futures(futures)
+
+        transfer_blocks = []
+        for src_ptr, dst_ptr, token_item_len in layers_params:
+            transfer_blocks.extend(
+                set_transfer_blocks(src_ptr, dst_ptr, token_item_len)
+            )
+        return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+    def send_kvcache_slice(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        dst_kv_item_len: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ):
+        """
+        Sends KV cache slices from this Prefill rank to a target Decode rank,
+        supporting generic M-to-N TP size configurations.
+
+        NOTE: This implementation calls the transfer engine for each token slot within
+        each page to ensure correctness for any page_size and head-slicing configuration.
+        This may introduce performance overhead (increased TTFT) for long sequences.
+        """
+        # Extract configuration
+        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        src_kv_item_len = self.kv_args.kv_item_lens[0]
+        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
+        page_size = self.kv_args.page_size
+
+        # Use total KV head count (not per-rank) for correct head distribution.
+        # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
+        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+        if total_kv_heads <= 0:
+            total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
+
+        src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
+        bytes_per_head_slice_to_send = (
+            dst_kv_item_len // page_size // dst_heads_per_rank
+        )
+
+        # GQA replication: how many prefill ranks share the same KV head
+        src_replication = max(1, self.attn_tp_size // total_kv_heads)
+
+        # Determine slicing parameters based on TP configuration
+        if self.attn_tp_size > dst_attn_tp_size:
+            # Send KVCache from multiple prefill instances to 1 decode instance
+            src_head_start_offset = 0
+            num_heads_to_send = src_heads_per_rank
+            unique_head_idx = local_tp_rank_in_group // src_replication
+            dst_head_start_offset = (
+                unique_head_idx * src_heads_per_rank
+            ) % dst_heads_per_rank
+        else:
+            # Send KVCache from 1 prefill instance to multiple decode instances
+            # GQA replication (total_kv_heads < dst_attn_tp_size): consecutive decode
+            # ranks share one KV head (QKVParallelLinear: tp_rank // num_kv_head_replicas),
+            # so map by integer division NOT modulo or ranks 1..r-1 fetch the wrong head.
+            dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
+            unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
+            src_head_start_offset = (
+                unique_dst_head_idx * dst_heads_per_rank
+            ) % src_heads_per_rank
+            num_heads_to_send = dst_heads_per_rank
+            dst_head_start_offset = 0
+
+        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+        )
+
+        # Calculate precise byte offset and length for the sub-slice within the token
+        src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
+        dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
+        heads_bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice_to_send
+
+        # Sanity check: The data sub-slice to be sent should fit into the dst buffer.
+        # This means heads_bytes_per_token_to_send <= (dst_kv_item_len // page_size)
+        if heads_bytes_per_token_to_send > (dst_kv_item_len // page_size):
+            logger.error(
+                f"[{mooncake_session_id}] slice size ({heads_bytes_per_token_to_send}) exceeds "
+                f"target token slot size ({dst_kv_item_len // page_size})"
+            )
+            return -1
+
+        prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
+        decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
+        tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
+        bytes_per_token_on_prefill = src_kv_item_len // page_size
+        bytes_per_token_on_decode = dst_kv_item_len // page_size
+        kv_cache_layout = getattr(self, "kv_cache_layout", None)
+        if kv_cache_layout is None:
+            # Compatibility with older CommonKVManager versions that do not
+            # propagate the pool layout through KVArgs yet.
+            kv_cache_layout = "hnd" if envs.SGLANG_USE_HND_KVCACHE.get() else "nhd"
+        is_hnd = kv_cache_layout == "hnd"
+        is_hcu_legacy = (
+            _kv_layout_hcu_fa
+            and not is_hnd
+            and not envs.SGLANG_USE_HND_KVCACHE.get()
+        )
+        if is_hnd:
+            # HND/BHSD pages are laid out as [page, head, token, dim]. Heads
+            # belonging to one token are therefore not contiguous: adjacent
+            # heads are page_size * head_bytes apart. Build one contiguous
+            # dim-slice per (page, head, token) instead of treating the page as
+            # token-major, which would silently corrupt asymmetric-TP KV data.
+            src_head_indices = np.arange(
+                src_head_start_offset,
+                src_head_start_offset + num_heads_to_send,
+                dtype=np.int64,
+            ).reshape(1, -1, 1)
+            dst_head_indices = np.arange(
+                dst_head_start_offset,
+                dst_head_start_offset + num_heads_to_send,
+                dtype=np.int64,
+            ).reshape(1, -1, 1)
+            token_offsets = np.arange(page_size, dtype=np.int64).reshape(1, 1, -1)
+            src_token_slot_offsets = (
+                src_head_indices * page_size + token_offsets
+            ) * bytes_per_head_slice_to_send
+            dst_token_slot_offsets = (
+                dst_head_indices * page_size + token_offsets
+            ) * bytes_per_head_slice_to_send
+            transfer_slice_len = bytes_per_head_slice_to_send
+        elif is_hcu_legacy:
+            # The legacy HCU FA cache is head-major within each page:
+            # K is [page, head, token, dim] and V is [page, head, dim, token].
+            # Although K and V differ inside a head, one whole head remains a
+            # contiguous page-sized byte range in both buffers. Transfer each
+            # selected head as one slice so asymmetric TP preserves the exact
+            # physical layout without assuming token-major NHD storage.
+            src_head_indices = np.arange(
+                src_head_start_offset,
+                src_head_start_offset + num_heads_to_send,
+                dtype=np.int64,
+            ).reshape(1, -1)
+            dst_head_indices = np.arange(
+                dst_head_start_offset,
+                dst_head_start_offset + num_heads_to_send,
+                dtype=np.int64,
+            ).reshape(1, -1)
+            head_page_bytes = page_size * bytes_per_head_slice_to_send
+            src_token_slot_offsets = src_head_indices * head_page_bytes
+            dst_token_slot_offsets = dst_head_indices * head_page_bytes
+            transfer_slice_len = head_page_bytes
+        else:
+            src_token_slot_offsets = (
+                tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
+            )
+            dst_token_slot_offsets = (
+                tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
+            )
+            transfer_slice_len = heads_bytes_per_token_to_send
+
+        def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
+            src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
+            dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
+            src_slice_addrs = src_page_base_addrs + src_token_slot_offsets
+            dst_slice_addrs = dst_page_base_addrs + dst_token_slot_offsets
+
+            src_addr_list = src_slice_addrs.reshape(-1).tolist()
+            if not src_addr_list:
+                # Nothing to transfer for this layer.
+                return 0
+            dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
+            total_slices = len(src_addr_list)
+            length_list = [transfer_slice_len] * total_slices
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            )
+
+        futures = []
+        for i in range(layers_current_pp_stage):
+            futures.append(
+                executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
+            )
+        for i in range(layers_current_pp_stage):
+            futures.append(
+                executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
+            )
+
+        return self._await_transfer_futures(futures)
+
+    def send_aux(
+        self,
+        req: TransferInfo,
+        prefill_aux_index: int,
+        dst_aux_ptrs: list[int],
+    ):
+        # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
+        if (
+            self.enable_custom_mem_pool and self.custom_mem_pool_type == "NVLINK"
+        ) or envs.SGLANG_MOONCAKE_SEND_AUX_TCP.get():
+            return self.send_aux_tcp(req, prefill_aux_index, dst_aux_ptrs)
+
+        transfer_blocks = []
+        prefill_aux_ptrs = self.kv_args.aux_data_ptrs
+        prefill_aux_item_lens = self.kv_args.aux_item_lens
+
+        for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+            length = prefill_aux_item_lens[i]
+            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+            dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
+            transfer_blocks.append((src_addr, dst_addr, length))
+
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+
+    def send_aux_tcp(
+        self,
+        req: TransferInfo,
+        prefill_aux_index: int,
+        dst_aux_ptrs: list[int],
+    ):
+        prefill_aux_ptrs = self.kv_args.aux_data_ptrs
+        prefill_aux_item_lens = self.kv_args.aux_item_lens
+
+        for i in range(len(prefill_aux_ptrs)):
+            length = prefill_aux_item_lens[i]
+            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+            data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
+
+            self.send_aux_data_to_endpoint(
+                remote=req.endpoint,
+                dst_port=req.dst_port,
+                room=req.room,
+                buffer_index=i,
+                aux_index=req.dst_aux_index,
+                data=data,
+            )
+
+        return 0
+
+    def send_aux_data_to_endpoint(
+        self,
+        remote: str,
+        dst_port: int,
+        room: int,
+        buffer_index: int,
+        aux_index: int,
+        data: bytes,
+    ):
+        na = NetworkAddress(remote, dst_port)
+        self._send_multipart_locked(
+            na.to_tcp(),
+            [
+                MooncakeKVManager.AUX_DATA_HEADER,
+                str(room).encode("ascii"),
+                str(buffer_index).encode("ascii"),
+                str(aux_index).encode("ascii"),
+                struct.pack(">I", len(data)),
+                data,
+            ],
+            is_ipv6=na.is_ipv6,
+        )
+
+    def _handle_aux_data(self, msg: List[bytes]):
+        """Handle AUX_DATA messages received by the decode thread."""
+        room = int(msg[1].decode("ascii"))
+        buffer_index = int(msg[2].decode("ascii"))
+        aux_index = int(msg[3].decode("ascii"))
+        data_length = struct.unpack(">I", msg[4])[0]
+        data = msg[5]
+
+        if len(data) != data_length:
+            logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")
+            return
+
+        AuxDataCodec.deserialize_data_to_buffer(
+            self.kv_args, buffer_index, aux_index, data
+        )
+
+        logger.debug(
+            f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
+        )
+
+    def _get_dsa_cache_transfer_skip_flags(
+        self, info: Optional[KVArgsRegisterInfo]
+    ) -> Tuple[bool, bool]:
+        skip_kv = False
+        skip_state = False
+
+        # Must be checked before the non-hybrid early return below, or every CP
+        # rank re-sends the same state and we transfer it cp_size times over.
+        # Prefill CP all-gathers before writing the pool, so every CP rank holds
+        # the full state regardless of whether the pool is hybrid. We assume no
+        # structure about the state rows, so we don't split them across CP ranks
+        # -- just let rank 0 send the whole thing (unless layer split already
+        # shards it per rank).
+        if (
+            self.attn_cp_size > 1
+            and self.attn_cp_rank != 0
+            and not get_parallel().enable_dsa_cache_layer_split
+            and not getattr(self, "cp_cache_layer_split", False)
+        ):
+            skip_state = True
+
+        if not self.is_hybrid_mla_backend:
+            return skip_kv, skip_state
+
+        if info is not None and self.attn_tp_size > info.dst_attn_tp_size:
+            sub_rank = (self.kv_args.engine_rank % self.attn_tp_size) % (
+                self.attn_tp_size // info.dst_attn_tp_size
+            )
+            if sub_rank != 0:
+                skip_kv = True
+                # Hybrid-MLA KV is replicated across these source ranks, but
+                # TP-sharded state needs every rank for the aggregation path.
+
+        return skip_kv, skip_state
+
+    def _is_generic_kvcache_state_type(self, st: StateType) -> bool:
+        """State types sent via the page-indexed ``_send_kvcache_generic`` path
+        (not the mamba-state path); subclasses extend for hardware components."""
+        return st in (
+            StateType.SWA,
+            StateType.DSA,
+            StateType.SWA_RING,
+            StateType.C128_STATE,
+            StateType.BLOCK_SCALE,
+            StateType.BLOCK_SCALE_SWA,
+        )
+
+    def _requires_exact_state_index_match(self, st: StateType) -> bool:
+        """State types whose page lists are positional and must not be truncated."""
+        return st in (StateType.SWA_RING, StateType.C128_STATE)
+
+    def maybe_send_extra(
+        self,
+        req: TransferInfo,
+        prefill_state_indices: List,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+    ):
+        rc = 0
+        state_types = getattr(self.kv_args, "state_types", [])
+        for i, st in enumerate(state_types):
+            indices = (
+                prefill_state_indices[i] if i < len(prefill_state_indices) else None
+            )
+            if indices is None:
+                continue
+            src_data_ptrs = self.kv_args.state_data_ptrs[i]
+            src_item_lens = self.kv_args.state_item_lens[i]
+            src_dim_per_tensor = (
+                self.kv_args.state_dim_per_tensor[i]
+                if i < len(self.kv_args.state_dim_per_tensor)
+                else []
+            )
+            src_conv_shard_groups = getattr(self.kv_args, "state_conv_shard_groups", [])
+            src_conv_shard_groups = (
+                src_conv_shard_groups[i] if i < len(src_conv_shard_groups) else []
+            )
+            src_slice_outer_counts = getattr(
+                self.kv_args, "state_slice_outer_counts", []
+            )
+            src_slice_outer_counts = (
+                src_slice_outer_counts[i] if i < len(src_slice_outer_counts) else []
+            )
+            src_state_layer_ids = self.kv_args.state_layer_ids
+            src_state_layer_ids = (
+                src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
+            )
+            dst_component_index = i
+            if target_rank_registration_info is not None:
+                dst_component_index = resolve_state_component_dst_index(
+                    state_types,
+                    target_rank_registration_info.dst_state_types,
+                    i,
+                )
+                dst_data_ptrs = (
+                    target_rank_registration_info.dst_state_data_ptrs[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_data_ptrs)
+                    else []
+                )
+                dst_item_lens = (
+                    target_rank_registration_info.dst_state_item_lens[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_item_lens)
+                    else []
+                )
+                dst_dim_per_tensor = (
+                    target_rank_registration_info.dst_state_dim_per_tensor[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_dim_per_tensor)
+                    else []
+                )
+                dst_state_layer_ids = (
+                    target_rank_registration_info.dst_state_layer_ids[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_layer_ids)
+                    else []
+                )
+            else:
+                dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
+                dst_state_layer_ids = []
+            src_layout = dst_layout = None
+            if getattr(self, "cp_cache_layer_split", False):
+                src_layout = self.kv_args.v4_transfer_metadata["states"][i]
+                metadata = getattr(target_rank_registration_info, "v4_transfer_metadata", {})
+                layouts = metadata.get("states", [])
+                dst_layout = layouts[dst_component_index] if dst_component_index < len(layouts) else []
+            dst_indices = (
+                req.dst_state_indices[dst_component_index]
+                if dst_component_index < len(req.dst_state_indices)
+                else []
+            )
+
+            if st == StateType.MAMBA:
+                if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
+                    src_item_lens
+                ) != list(dst_item_lens):
+                    raise RuntimeError(
+                        "Mamba state layouts differ between prefill and decode "
+                        f"(src item_lens={src_item_lens}, dst item_lens="
+                        f"{dst_item_lens}) and no per-tensor dim metadata is "
+                        "available to reslice. With --enable-unified-memory, "
+                        "prefill and decode must both enable it and use equal "
+                        "attention TP sizes."
+                    )
+                if (
+                    target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
+                ):
+                    rc = (
+                        self._send_mamba_state_slice(
+                            req,
+                            indices,
+                            src_data_ptrs,
+                            src_item_lens,
+                            src_dim_per_tensor,
+                            dst_data_ptrs,
+                            dst_indices,
+                            dst_item_lens,
+                            dst_dim_per_tensor,
+                            target_rank_registration_info.dst_tp_rank,
+                            target_rank_registration_info.dst_attn_tp_size,
+                            src_conv_shard_groups,
+                            src_slice_outer_counts,
+                            src_state_layer_ids,
+                            dst_state_layer_ids,
+                        )
+                        or rc
+                    )
+                else:
+                    rc = (
+                        self._send_mamba_state(
+                            req,
+                            indices,
+                            src_data_ptrs,
+                            src_item_lens,
+                            dst_data_ptrs,
+                            dst_indices,
+                            src_state_layer_ids,
+                            dst_state_layer_ids,
+                        )
+                        or rc
+                    )
+            elif self._is_generic_kvcache_state_type(st):
+                if (
+                    target_rank_registration_info is not None
+                    and not self.is_mla_backend
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
+                ):
+                    raise RuntimeError(
+                        f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
+                    )
+                src_indices = list(indices)
+                dst_indices_local = list(dst_indices)
+                if (
+                    st == StateType.C128_STATE
+                    and len(src_indices) == 0
+                    and len(dst_indices_local) == 0
+                ):
+                    continue
+                if len(src_indices) != len(dst_indices_local):
+                    # These components are position- or request-indexed:
+                    # truncating silently misaligns rows and corrupts KV.
+                    # Paged SWA/DSA tolerate a 1-page drift -> keep the
+                    # lenient truncation below.
+                    if self._requires_exact_state_index_match(st):
+                        raise RuntimeError(
+                            f"{st.upper()} state index length mismatch: "
+                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                        )
+                    logger.warning(
+                        f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
+                    )
+                    if len(src_indices) > len(dst_indices_local):
+                        src_indices = src_indices[: len(dst_indices_local)]
+                    else:
+                        dst_indices_local = dst_indices_local[: len(src_indices)]
+                if st == StateType.PD_HIDDEN and dynamic_dst:
+                    row_chunks = dynamic_dst.get("row_chunks") or [
+                        {"row_start": 0, "row_len": len(src_indices)}
+                    ]
+                    for row_chunk in row_chunks:
+                        row_start = int(row_chunk.get("row_start", 0))
+                        row_len = int(row_chunk.get("row_len", 0))
+                        if row_len <= 0:
+                            continue
+                        row_end = row_start + row_len
+                        if row_start < 0 or row_end > len(src_indices):
+                            raise RuntimeError(
+                                "Invalid PD hidden row chunk: "
+                                f"room={req.room}, row_start={row_start}, "
+                                f"row_len={row_len}, row_count={len(src_indices)}"
+                            )
+                        if "ptr" in row_chunk:
+                            chunk_dst_data_ptrs = [int(row_chunk["ptr"])]
+                            chunk_dst_indices = list(range(row_len))
+                        else:
+                            chunk_dst_data_ptrs = dst_data_ptrs
+                            chunk_dst_indices = dst_indices_local[row_start:row_end]
+                        rc = (
+                            self._send_kvcache_generic(
+                                mooncake_session_id=req.mooncake_session_id,
+                                src_data_ptrs=src_data_ptrs,
+                                dst_data_ptrs=chunk_dst_data_ptrs,
+                                item_lens=src_item_lens,
+                                prefill_data_indices=np.array(
+                                    src_indices[row_start:row_end], dtype=np.int32
+                                ),
+                                dst_data_indices=np.array(
+                                    chunk_dst_indices, dtype=np.int32
+                                ),
+                                executor=executor,
+                                state_type=st,
+                            )
+                            or rc
+                        )
+                    continue
+                rc = (
+                    self._send_kvcache_generic(
+                        mooncake_session_id=req.mooncake_session_id,
+                        src_data_ptrs=src_data_ptrs,
+                        dst_data_ptrs=dst_data_ptrs,
+                        item_lens=src_item_lens,
+                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                        dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
+                        executor=executor,
+                        state_type=st,
+                        src_layer_ids=src_state_layer_ids,
+                        dst_layer_ids=dst_state_layer_ids,
+                        src_layout=src_layout,
+                        dst_layout=dst_layout,
+                        dst_item_lens=dst_item_lens,
+                    )
+                    or rc
+                )
+            elif st == StateType.MINIMAX_INDEX_K:
+                # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
+                # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
+                if self.pp_size is not None and self.pp_size > 1:
+                    raise RuntimeError(
+                        "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                    )
+                if (
+                    target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
+                ):
+                    raise RuntimeError(
+                        "PD disagg: heterogeneous TP not supported for MiniMax "
+                        "sparse index yet."
+                    )
+                src_indices = list(indices)
+                dst_indices_local = list(dst_indices)
+                if len(src_indices) > len(dst_indices_local):
+                    src_indices = src_indices[: len(dst_indices_local)]
+                elif len(src_indices) < len(dst_indices_local):
+                    dst_indices_local = dst_indices_local[: len(src_indices)]
+                rc = (
+                    self._send_kvcache_generic(
+                        mooncake_session_id=req.mooncake_session_id,
+                        src_data_ptrs=src_data_ptrs,
+                        dst_data_ptrs=dst_data_ptrs,
+                        item_lens=src_item_lens,
+                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                        dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
+                        executor=executor,
+                        force_flat=True,
+                    )
+                    or rc
+                )
+        return rc
+
+    def _send_pd_hidden_packet(
+        self,
+        req: TransferInfo,
+        prefill_state_indices: List,
+        packet_idx: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> Tuple[int, bool]:
+        state_idx = self._pd_hidden_state_index()
+        if state_idx is None or state_idx >= len(prefill_state_indices):
+            return 0, True
+        indices = prefill_state_indices[state_idx]
+        if indices is None:
+            return 0, True
+        src_indices = np.asarray(indices, dtype=np.int32)
+        dynamic_dst = (req.spec_metadata or {}).get("pp_slice", {}).get("dynamic_dst")
+        if not dynamic_dst:
+            if packet_idx > 0:
+                return 0, True
+            if state_idx >= len(req.dst_state_indices):
+                return 0, True
+            dst_indices = np.asarray(req.dst_state_indices[state_idx], dtype=np.int32)
+            if len(src_indices) == 0 and len(dst_indices) == 0:
+                return 0, True
+            if (req.spec_metadata or {}).get("streaming_hidden"):
+                dst_indices = dst_indices[: len(src_indices)]
+            if len(src_indices) != len(dst_indices):
+                raise RuntimeError(
+                    "PD_HIDDEN state index length mismatch: "
+                    f"room={req.room}, prefill={len(src_indices)}, "
+                    f"dst={len(dst_indices)}"
+                )
+            target_rank_registration_info = self.decode_kv_args_table[
+                req.mooncake_session_id
+            ]
+            dst_data_ptrs = (
+                target_rank_registration_info.dst_state_data_ptrs[state_idx]
+                if state_idx < len(target_rank_registration_info.dst_state_data_ptrs)
+                else []
+            )
+            rc = self._send_kvcache_generic(
+                mooncake_session_id=req.mooncake_session_id,
+                src_data_ptrs=self.kv_args.state_data_ptrs[state_idx],
+                dst_data_ptrs=dst_data_ptrs,
+                item_lens=self.kv_args.state_item_lens[state_idx],
+                prefill_data_indices=src_indices,
+                dst_data_indices=dst_indices,
+                executor=executor,
+                state_type=StateType.PD_HIDDEN,
+            )
+            return rc, True
+        row_chunks = dynamic_dst.get("row_chunks") or []
+        if packet_idx >= len(row_chunks):
+            return 0, True
+
+        row_chunk = row_chunks[packet_idx]
+        row_start = int(row_chunk.get("row_start", 0))
+        row_len = int(row_chunk.get("row_len", 0))
+        if row_len <= 0:
+            return 0, packet_idx + 1 >= len(row_chunks)
+        row_end = row_start + row_len
+        if row_start < 0 or row_end > len(src_indices):
+            raise RuntimeError(
+                "Invalid PD hidden packet: "
+                f"room={req.room}, packet_idx={packet_idx}, "
+                f"row_start={row_start}, row_len={row_len}, "
+                f"row_count={len(src_indices)}"
+            )
+
+        src_data_ptrs = self.kv_args.state_data_ptrs[state_idx]
+        dst_data_ptrs = [int(row_chunk.get("ptr", dynamic_dst.get("ptr", 0)))]
+        item_lens = [int(dynamic_dst["item_len"])]
+        rc = self._send_kvcache_generic(
+            mooncake_session_id=req.mooncake_session_id,
+            src_data_ptrs=src_data_ptrs,
+            dst_data_ptrs=dst_data_ptrs,
+            item_lens=item_lens,
+            prefill_data_indices=src_indices[row_start:row_end],
+            dst_data_indices=np.arange(row_len, dtype=np.int32),
+            executor=executor,
+            state_type=StateType.PD_HIDDEN,
+        )
+        return rc, packet_idx + 1 >= len(row_chunks)
+
+    def _send_mamba_state(
+        self,
+        req: TransferInfo,
+        prefill_mamba_index: list,
+        src_state_data_ptrs: list[int],
+        src_state_item_lens: list[int],
+        dst_state_data_ptrs: list[int],
+        dst_mamba_index: list,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
+    ):
+        assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
+
+        transfer_blocks = []
+        pairs = build_transfer_entry_pairs(
+            src_layer_ids or [],
+            dst_layer_ids or [],
+            len(src_state_data_ptrs),
+            len(dst_state_data_ptrs),
+            allow_positional_fallback=self.pp_size == 1,
+        )
+        for i, j in pairs:
+            dst_state_ptr = dst_state_data_ptrs[j]
+            length = src_state_item_lens[i]
+            src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
+            dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
+            transfer_blocks.append((src_addr, dst_addr, length))
+
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+
+    def _send_mamba_state_slice(
+        self,
+        req: TransferInfo,
+        prefill_mamba_index: list,
+        src_state_data_ptrs: list[int],
+        src_state_item_lens: list[int],
+        src_state_dim_per_tensor: list[int],
+        dst_state_data_ptrs: list[int],
+        dst_mamba_index: list,
+        dst_state_item_lens: list[int],
+        dst_state_dim_per_tensor: list[int],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        src_state_conv_shard_groups: list = None,
+        src_state_slice_outer_counts: list[int] = None,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
+    ):
+        """Transfer Mamba states with TP slice support.
+
+        Mamba state layout:
+        - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
+        - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
+
+        The 3rd dimension is sliced by TP. When prefill and decode have different
+        attn_tp_size, we slice the state accordingly. GDN conv_state is the
+        concatenation [query | key | value] with each sub-block head-sharded
+        independently, so on the scatter path it is sliced per sub-block via
+        ``src_state_conv_shard_groups`` (see compute_mamba_state_slice_blocks).
+        """
+        logger.warning_once(
+            "Using Mamba state slice transfer for different TP sizes between prefill and decode. "
+            f"Prefill attn_tp_size={self.attn_tp_size}, Decode attn_tp_size={dst_attn_tp_size}. "
+            "Performance may be affected."
+        )
+        assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
+
+        # If no dimension info available, fall back to regular transfer
+        if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
+            return self._send_mamba_state(
+                req,
+                prefill_mamba_index,
+                src_state_data_ptrs,
+                src_state_item_lens,
+                dst_state_data_ptrs,
+                dst_mamba_index,
+                src_layer_ids,
+                dst_layer_ids,
+            )
+
+        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
+
+        transfer_blocks = []
+        pairs = build_transfer_entry_pairs(
+            src_layer_ids or [],
+            dst_layer_ids or [],
+            len(src_state_data_ptrs),
+            len(dst_state_data_ptrs),
+            allow_positional_fallback=self.pp_size == 1,
+        )
+        for i, j in pairs:
+            dst_state_ptr = dst_state_data_ptrs[j]
+            src_item_len = src_state_item_lens[i]
+            dst_item_len = dst_state_item_lens[j]
+            src_dim = src_state_dim_per_tensor[i]
+            dst_dim = dst_state_dim_per_tensor[j]
+
+            conv_shard_groups = (
+                src_state_conv_shard_groups[i]
+                if src_state_conv_shard_groups and i < len(src_state_conv_shard_groups)
+                else None
+            )
+            outer_count = (
+                src_state_slice_outer_counts[i]
+                if src_state_slice_outer_counts
+                and i < len(src_state_slice_outer_counts)
+                else 1
+            )
+            for (
+                src_offset,
+                dst_offset,
+                bytes_to_send,
+            ) in compute_mamba_state_slice_byte_blocks(
+                src_item_len=src_item_len,
+                dst_item_len=dst_item_len,
+                src_dim=src_dim,
+                dst_dim=dst_dim,
+                outer_count=outer_count,
+                src_attn_tp_size=self.attn_tp_size,
+                dst_attn_tp_size=dst_attn_tp_size,
+                dst_tp_rank_in_group=dst_tp_rank_in_group,
+                local_tp_rank_in_group=local_tp_rank_in_group,
+                conv_shard_groups=conv_shard_groups,
+            ):
+                src_addr = (
+                    src_state_data_ptrs[i]
+                    + src_item_len * int(prefill_mamba_index[0])
+                    + src_offset
+                )
+                dst_addr = (
+                    dst_state_ptr + dst_item_len * int(dst_mamba_index[0]) + dst_offset
+                )
+                transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
+
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+
+    def sync_status_to_decode_endpoint(
+        self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
+    ):
+        na = NetworkAddress(remote, dst_port)
+        self._send_multipart_locked(
+            na.to_tcp(),
+            [
+                str(room).encode("ascii"),
+                str(status).encode("ascii"),
+                str(prefill_rank).encode("ascii"),
+            ],
+            is_ipv6=na.is_ipv6,
+        )
+
+    def transfer_worker(
+        self,
+        queue: FastQueue,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        staging_buffer=None,
+        worker_index=0,
+    ):
+        staging_strategy = None
+        if self.enable_trace:
+            trace_set_thread_info(
+                f"mooncake transfer worker {worker_index}",
+                tp_rank=self.attn_tp_rank,
+                dp_rank=self.attn_dp_rank,
+            )
+
+        while True:
+            kv_chunk = None
+            try:
+                kv_chunk: TransferKVChunk = queue.get()
+                if self.enable_trace:
+                    kv_chunk.trace_ctx.rebuild_thread_context()
+                    kv_chunk.trace_ctx.trace_slice_start(
+                        MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+                        MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+                    )
+
+                # Counted at dequeue, before the status check, so
+                # `outstanding == 0` means nothing is dequeued or in flight --
+                # the predicate the abort ack relies on. The flag survives
+                # re-enqueue on defer.
+                if not kv_chunk.staging_counted:
+                    self._staging_outstanding[kv_chunk.room] += 1
+                    kv_chunk.staging_counted = True
+
+                if kv_chunk.source_event is not None:
+                    kv_chunk.source_event.synchronize()
+                    kv_chunk.source_event = None
+
+                if (
+                    kv_chunk.room not in self.request_status
+                    or self.check_status(kv_chunk.room) == KVPoll.Failed
+                ):
+                    # Only a recorded Failed status has hidden-ack waiters to
+                    # release; an unknown room never registered any.
+                    if kv_chunk.room in self.request_status:
+                        self._wake_pd_hidden_ack_waiters(kv_chunk.room)
+                    logger.debug(
+                        f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
+                    )
+                    if kv_chunk.pd_hidden_start is not None:
+                        with self.pd_hidden_events.inflight_lock:
+                            self.pd_hidden_events.inflight_chunks.pop(
+                                kv_chunk.room, None
+                            )
+                    if not kv_chunk.pd_hidden_sent and self._has_pd_hidden_state(
+                        kv_chunk.state_indices
+                    ):
+                        self._release_or_mark_pd_hidden_done(kv_chunk)
+                    if self.enable_trace:
+                        kv_chunk.trace_ctx.trace_slice_end(
+                            MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+                            MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+                            thread_finish_flag=True,
+                        )
+                    self._staging_outstanding.pop(kv_chunk.room, None)
+                    self._notify_transfer_waiters()
+                    if self.enable_deferred_decode_kv_release:
+                        # Skipped => nothing written for this aborted room; ack.
+                        self._maybe_ack_drained_abort(kv_chunk.room)
+                    self._source_drain.complete(kv_chunk)
+                    continue
+
+                reqs_to_be_processed = list(
+                    self.transfer_infos[kv_chunk.room].values()
+                    if kv_chunk.room in self.transfer_infos
+                    else []
+                )
+                polls = []
+                dst_ranks_infos = []
+                pd_hidden_expected = 0
+                pd_hidden_done_count = 0
+                # Unique id per prefill sender so decode's response set size matches expected_response_num.
+                prefill_unique_rank = (
+                    self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                    + self.pp_rank * self.attn_cp_size
+                    + self.attn_cp_rank
+                )
+
+                registration_error = None
+                for req in reqs_to_be_processed:
+                    if req.is_dummy:
+                        continue
+                    registration_info = self.decode_kv_args_table.get(
+                        req.mooncake_session_id
+                    )
+                    if registration_info is None:
+                        registration_error = (
+                            "Decode peer registration is missing for Mooncake "
+                            f"session {req.mooncake_session_id!r}"
+                        )
+                        break
+                    if registration_info.registration_error is not None:
+                        registration_error = (
+                            f"Decode peer {req.mooncake_session_id!r} is "
+                            f"incompatible: {registration_info.registration_error}"
+                        )
+                        break
+
+                if registration_error is not None:
+                    logger.error(
+                        "Rejecting PD transfer for room %s: %s",
+                        kv_chunk.room,
+                        registration_error,
+                    )
+                    self.record_failure(kv_chunk.room, registration_error)
+                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                    for req in reqs_to_be_processed:
+                        if not req.is_dummy:
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                    if self.enable_trace:
+                        kv_chunk.trace_ctx.trace_slice_end(
+                            MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+                            MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+                            thread_finish_flag=True,
+                        )
+                    self._staging_outstanding[kv_chunk.room] -= 1
+                    if self._staging_outstanding[kv_chunk.room] <= 0:
+                        self._staging_outstanding.pop(kv_chunk.room, None)
+                    self._notify_transfer_waiters()
+                    if self.enable_deferred_decode_kv_release:
+                        self._maybe_ack_drained_abort(kv_chunk.room)
+                    self._source_drain.complete(kv_chunk)
+                    continue
+                if (
+                    self.enable_staging
+                    and staging_strategy is None
+                    and staging_buffer is not None
+                ):
+                    staging_strategy = self._try_create_staging_strategy(staging_buffer)
+                polls = []
+                dst_ranks_infos = []
+                # When staging transfer is not yet ready (watermark/allocation pending),
+                # the chunk is re-enqueued and we break out of the req loop to retry later.
+                staging_deferred = False
+                pd_hidden_deferred = False
+                pd_hidden_failed = False
+                if (
+                    not kv_chunk.pd_hidden_sent
+                    and kv_chunk.state_indices
+                    and self._has_pd_hidden_state(kv_chunk.state_indices)
+                ):
+                    state_idx = self._pd_hidden_state_index()
+                    for req in reqs_to_be_processed:
+                        if req.is_dummy:
+                            continue
+                        target_rank_registration_info = self.decode_kv_args_table[
+                            req.mooncake_session_id
+                        ]
+                        _, skip_state = self._get_dsa_cache_transfer_skip_flags(
+                            target_rank_registration_info
+                        )
+                        if not skip_state:
+                            pd_hidden_expected += 1
+
+                    waiting_for_ack = (
+                        kv_chunk.pd_hidden_start is not None
+                        and kv_chunk.pd_hidden_ready_sent
+                    )
+                    hidden_inflight_key = (
+                        (prefill_unique_rank, int(kv_chunk.pd_hidden_start))
+                        if kv_chunk.pd_hidden_start is not None
+                        else None
+                    )
+                    if (
+                        hidden_inflight_key is not None
+                        and not kv_chunk.pd_hidden_ready_sent
+                    ):
+                        with self.pd_hidden_events.inflight_lock:
+                            inflight_key = self.pd_hidden_events.inflight_chunks.get(
+                                kv_chunk.room
+                            )
+                        if (
+                            inflight_key is not None
+                            and inflight_key != hidden_inflight_key
+                        ):
+                            self._park_pd_hidden_chunk_behind_room(queue, kv_chunk)
+                            continue
+                    ack_ready = False
+                    if waiting_for_ack:
+                        ack_ready = kv_chunk.pd_hidden_ack_ready
+                        if ack_ready:
+                            pd_hidden_done_count = pd_hidden_expected
+                            self._finish_pd_hidden_streaming_chunk(
+                                kv_chunk, hidden_inflight_key
+                            )
+                        elif kv_chunk.pd_hidden_ack_timed_out:
+                            pd_hidden_failed = True
+
+                    if not ack_ready and not waiting_for_ack:
+                        for req in reqs_to_be_processed:
+                            if req.is_dummy:
+                                continue
+                            with self.session_lock:
+                                session_failed = (
+                                    req.mooncake_session_id in self.failed_sessions
+                                )
+                            if session_failed:
+                                continue
+                            target_rank_registration_info = self.decode_kv_args_table[
+                                req.mooncake_session_id
+                            ]
+                            _, skip_state = self._get_dsa_cache_transfer_skip_flags(
+                                target_rank_registration_info
+                            )
+                            if skip_state:
+                                continue
+                            self._begin_pd_hidden_transfer(kv_chunk.room)
+                            try:
+                                ret, pd_hidden_done = self._send_pd_hidden_packet(
+                                    req,
+                                    kv_chunk.state_indices,
+                                    kv_chunk.pd_hidden_packet_idx,
+                                    executor,
+                                )
+                            finally:
+                                self._end_pd_hidden_transfer(kv_chunk.room)
+                            if ret != 0:
+                                self._mark_session_failed_and_sync(
+                                    kv_chunk=kv_chunk,
+                                    req=req,
+                                    prefill_unique_rank=prefill_unique_rank,
+                                    failure_reason=(
+                                        "Failed to send PD hidden packet "
+                                        f"{kv_chunk.pd_hidden_packet_idx} of "
+                                        f"{kv_chunk.room} to "
+                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}"
+                                    ),
+                                )
+                                if kv_chunk.pd_hidden_start is not None:
+                                    with self.pd_hidden_events.inflight_lock:
+                                        self.pd_hidden_events.inflight_chunks.pop(
+                                            kv_chunk.room, None
+                                        )
+                                self._release_or_mark_pd_hidden_done(kv_chunk)
+                                pd_hidden_failed = True
+                                break
+                            if not pd_hidden_done:
+                                pd_hidden_deferred = True
+                                continue
+                            if (
+                                kv_chunk.pd_hidden_start is not None
+                                and state_idx is not None
+                                and state_idx < len(kv_chunk.state_indices)
+                            ):
+                                dst_indices = (
+                                    req.dst_state_indices[state_idx]
+                                    if state_idx < len(req.dst_state_indices)
+                                    else []
+                                )
+                                row_len = int(kv_chunk.pd_hidden_row_len)
+                                chunk_dst_indices = [
+                                    int(x) for x in dst_indices[:row_len]
+                                ]
+                                self.notify_pd_hidden_chunk_ready(
+                                    remote=req.endpoint,
+                                    dst_port=req.dst_port,
+                                    room=req.room,
+                                    prefill_rank=prefill_unique_rank,
+                                    hidden_start=int(kv_chunk.pd_hidden_start),
+                                    row_len=row_len,
+                                    is_last_hidden_chunk=bool(
+                                        kv_chunk.pd_hidden_is_last_chunk
+                                    ),
+                                    dst_indices=chunk_dst_indices,
+                                )
+                                continue
+                            pd_hidden_done_count += 1
+
+                    if pd_hidden_failed:
+                        self._source_drain.complete(kv_chunk)
+                        continue
+                    if waiting_for_ack and not ack_ready:
+                        # A parked chunk is only re-enqueued by ACK/abort/timeout.
+                        # Reaching this branch without a terminal status means a
+                        # duplicate wakeup; avoid busy requeueing it.
+                        continue
+                    if (
+                        kv_chunk.pd_hidden_start is not None
+                        and not kv_chunk.pd_hidden_ready_sent
+                    ):
+                        if hidden_inflight_key is not None:
+                            with self.pd_hidden_events.inflight_lock:
+                                self.pd_hidden_events.inflight_chunks[kv_chunk.room] = (
+                                    hidden_inflight_key
+                                )
+                        kv_chunk.pd_hidden_ready_sent = True
+                        if self.park_pd_hidden_chunk_for_ack(
+                            transfer_queue=queue,
+                            kv_chunk=kv_chunk,
+                            prefill_rank=prefill_unique_rank,
+                            expected_count=pd_hidden_expected,
+                        ):
+                            continue
+                        ack_ready = True
+                        pd_hidden_done_count = pd_hidden_expected
+                        self._finish_pd_hidden_streaming_chunk(
+                            kv_chunk, hidden_inflight_key
+                        )
+                    current_status = self.request_status.get(kv_chunk.room)
+                    if (
+                        pd_hidden_expected > 0
+                        and pd_hidden_done_count == pd_hidden_expected
+                        and current_status is not None
+                        and current_status != KVPoll.Failed
+                    ):
+                        kv_chunk.pd_hidden_sent = True
+                        if kv_chunk.pd_hidden_start is not None:
+                            if kv_chunk.pd_hidden_is_last_chunk:
+                                self.mark_pd_hidden_request_done(
+                                    kv_chunk.room,
+                                    None,
+                                )
+                        else:
+                            self.mark_pd_hidden_request_done(
+                                kv_chunk.room,
+                                self._pd_hidden_release_state_indices(kv_chunk),
+                            )
+                    if pd_hidden_deferred:
+                        kv_chunk.pd_hidden_packet_idx += 1
+                        queue.put(kv_chunk)
+                        continue
+
+                for req in reqs_to_be_processed:
+                    start_ts = time.perf_counter()
+                    if not req.is_dummy:
+                        # Early exit if the request has failed
+                        with self.session_lock:
+                            if req.mooncake_session_id in self.failed_sessions:
+                                self.record_failure(
+                                    kv_chunk.room,
+                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                )
+                                self.update_status(kv_chunk.room, KVPoll.Failed)
+                                self.sync_status_to_decode_endpoint(
+                                    req.endpoint,
+                                    req.dst_port,
+                                    req.room,
+                                    KVPoll.Failed,
+                                    prefill_unique_rank,
+                                )
+                                if (
+                                    kv_chunk.is_last_chunk
+                                    and not kv_chunk.pd_hidden_sent
+                                    and self._has_pd_hidden_state(
+                                        kv_chunk.state_indices
+                                    )
+                                ):
+                                    self._release_or_mark_pd_hidden_done(kv_chunk)
+                                break
+
+                        target_rank_registration_info: KVArgsRegisterInfo = (
+                            self.decode_kv_args_table[req.mooncake_session_id]
+                        )
+                        is_dcp_transfer = (
+                            target_rank_registration_info.requires_dcp_relayout
+                        )
+                        chunked_dst_device_kv_indice = None
+                        if is_dcp_transfer:
+                            if req.dst_device_kv_indices is not None:
+                                raise RuntimeError(
+                                    "HiSparse destination device indices are not "
+                                    "supported by PD DCP relayout"
+                                )
+                            chunked_dst_kv_indice = req.dst_kv_indices
+                        else:
+                            chunked_dst_kv_indice = req.dst_kv_indices[
+                                kv_chunk.index_slice
+                            ]
+                            if req.dst_device_kv_indices is not None:
+                                chunked_dst_device_kv_indice = (
+                                    req.dst_device_kv_indices[kv_chunk.index_slice]
+                                )
+
+                            # A source/destination page-count mismatch means the
+                            # decode allocation no longer describes this prefill
+                            # chunk. Truncating either side silently accepts a
+                            # partial KV cache and can produce plausible-looking
+                            # but corrupted tokens. Fail the request before RDMA
+                            # instead; PP consensus will release both stages.
+                            src_page_count = len(kv_chunk.prefill_kv_indices)
+                            dst_page_count = len(chunked_dst_kv_indice)
+                            if src_page_count != dst_page_count:
+                                failure_reason = (
+                                    "KV page-count mismatch before Mooncake transfer: "
+                                    f"room={kv_chunk.room}, src_pages={src_page_count}, "
+                                    f"dst_pages={dst_page_count}, slice={kv_chunk.index_slice}"
+                                )
+                                logger.error(failure_reason)
+                                self.record_failure(kv_chunk.room, failure_reason)
+                                self.update_status(kv_chunk.room, KVPoll.Failed)
+                                self.sync_status_to_decode_endpoint(
+                                    req.endpoint,
+                                    req.dst_port,
+                                    req.room,
+                                    KVPoll.Failed,
+                                    prefill_unique_rank,
+                                )
+                                break
+
+                        skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
+                            target_rank_registration_info
+                        )
+                        if kv_chunk.kv_sent:
+                            ret = 0
+                        elif (
+                            len(kv_chunk.prefill_kv_indices) == 0
+                            or not self.kv_args.kv_data_ptrs
+                            or skip_kv
+                        ):
+                            ret = 0
+                        elif is_dcp_transfer:
+                            dcp_token_item_lens = (
+                                target_rank_registration_info.dcp_token_item_lens
+                            )
+                            assert dcp_token_item_lens is not None
+                            ret = self.send_kvcache_dcp(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                dcp_token_item_lens=dcp_token_item_lens,
+                                dst_dcp_size=target_rank_registration_info.dst_dcp_size,
+                                dst_dcp_rank=target_rank_registration_info.dst_dcp_rank,
+                                src_page_offset=kv_chunk.index_slice.start or 0,
+                                decode_prefix_len=req.decode_prefix_len or 0,
+                                num_kv_tokens=kv_chunk.num_kv_tokens,
+                                executor=executor,
+                                dst_layer_ids=(
+                                    target_rank_registration_info.dst_kv_layer_ids
+                                ),
+                            )
+                        elif (
+                            self.is_mla_backend
+                            or self.is_hybrid_mla_backend
+                            or self.attn_tp_size
+                            == target_rank_registration_info.dst_attn_tp_size
+                        ):
+                            ret = self.send_kvcache(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                executor,
+                                dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
+                                v4_transfer_metadata=target_rank_registration_info.v4_transfer_metadata,
+                                dst_device_kv_indices=chunked_dst_device_kv_indice,
+                                dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
+                                dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                            )
+                        elif (
+                            self.enable_staging
+                            and staging_strategy is not None
+                            and (
+                                target_rank_registration_info.staging_base_ptr != 0
+                                or target_rank_registration_info.staging_total_size != 0
+                            )
+                        ):
+                            ret, deferred = self._do_staging_transfer(
+                                staging_strategy,
+                                kv_chunk,
+                                req,
+                                target_rank_registration_info,
+                                chunked_dst_kv_indice,
+                                executor,
+                                queue,
+                                prefill_unique_rank,
+                            )
+                            if deferred:
+                                staging_deferred = True
+                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
+                                break
+                        else:
+                            # Asymmetric attn TP (prefill != decode) without staging:
+                            # fall back to the per-slice path.  This is the chain's
+                            # catch-all -- without it `ret` stays unbound below.
+                            ret = self.send_kvcache_slice(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                target_rank_registration_info.dst_tp_rank,
+                                target_rank_registration_info.dst_attn_tp_size,
+                                target_rank_registration_info.dst_kv_item_len,
+                                executor,
+                            )
+                        if ret != 0:
+                            self._mark_session_failed_and_sync(
+                                kv_chunk=kv_chunk,
+                                req=req,
+                                prefill_unique_rank=prefill_unique_rank,
+                                failure_reason=(
+                                    f"Failed to send kv chunk of {kv_chunk.room} to "
+                                    f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}"
+                                ),
+                            )
+                            break
+
+                        if kv_chunk.is_last_chunk:
+                            if kv_chunk.state_indices and not skip_state:
+                                state_rc = self.maybe_send_extra(
+                                    req,
+                                    self._without_pd_hidden_state(
+                                        kv_chunk.state_indices
+                                    ),
+                                    executor,
+                                    target_rank_registration_info,
+                                )
+                                if state_rc != 0:
+                                    with self.session_lock:
+                                        self.session_failures[
+                                            req.mooncake_session_id
+                                        ] += 1
+                                        self.failed_sessions.add(
+                                            req.mooncake_session_id
+                                        )
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Failed to send state components of {kv_chunk.room} to "
+                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                    )
+                                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                    )
+                                    break
+
+                            # Only the last chunk we need to send the aux data
+                            ret = self.send_aux(
+                                req,
+                                kv_chunk.prefill_aux_index,
+                                target_rank_registration_info.dst_aux_ptrs,
+                            )
+                            polls.append(True if ret == 0 else False)
+                            dst_ranks_infos.append(
+                                (req.endpoint, req.dst_port, req.room)
+                            )
+                            # Only sync status when all the dst ranks have received the kvcache
+                            if len(polls) == req.required_dst_info_num:
+                                status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                self.update_status(req.room, status)
+                                for endpoint, dst_port, room in dst_ranks_infos:
+                                    self.sync_status_to_decode_endpoint(
+                                        endpoint,
+                                        dst_port,
+                                        room,
+                                        status,
+                                        prefill_unique_rank,
+                                    )
+                    else:
+                        # Dummy request means the decode instance is not used, so its status can be marked as success directly
+                        # Dummy request does not need to sync status to decode endpoint
+                        if kv_chunk.is_last_chunk and req.room in self.request_status:
+                            self.update_status(req.room, KVPoll.Success)
+
+                    if self.enable_trace:
+                        mooncake_trace_slice(
+                            kv_chunk.trace_ctx,
+                            MooncakeRequestStage.MOONCAKE_WORKER_SEND_SESSION,
+                            start_ts,
+                        )
+
+                if self.enable_trace:
+                    kv_chunk.trace_ctx.trace_slice_end(
+                        MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+                        MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+                        thread_finish_flag=True,
+                    )
+
+                if staging_deferred:
+                    continue
+
+                self._staging_outstanding[kv_chunk.room] -= 1
+                if self.enable_deferred_decode_kv_release:
+                    # In-flight write finished; if aborted and nothing outstanding,
+                    # the pages are idle -> release the held ack.
+                    self._maybe_ack_drained_abort(kv_chunk.room)
+                # Tear down only when no chunk is still outstanding and the room
+                # has concluded: already cleared, Success, or a Failed *last*
+                # chunk. A non-last Failed chunk keeps the room (more chunks may
+                # follow), not on the last chunk alone since an earlier deferred
+                # chunk may still need to transfer.
+                if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
+                    kv_chunk.room not in self.request_status
+                    or self.check_status(kv_chunk.room) == KVPoll.Success
+                    or (
+                        kv_chunk.is_last_chunk
+                        and self.check_status(kv_chunk.room) == KVPoll.Failed
+                    )
+                ):
+                    self._staging_outstanding.pop(kv_chunk.room, None)
+                self._notify_transfer_waiters()
+                current_status = self.request_status.get(kv_chunk.room)
+                if current_status is not None and current_status != KVPoll.Failed:
+                    kv_chunk.kv_sent = True
+                if (
+                    kv_chunk.is_last_chunk
+                    and not kv_chunk.pd_hidden_sent
+                    and pd_hidden_expected > 0
+                    and pd_hidden_done_count == pd_hidden_expected
+                    and current_status is not None
+                    and current_status != KVPoll.Failed
+                ):
+                    if kv_chunk.pd_hidden_start is not None:
+                        if kv_chunk.pd_hidden_is_last_chunk:
+                            self.mark_pd_hidden_request_done(
+                                kv_chunk.room,
+                                self._pd_hidden_release_state_indices(kv_chunk),
+                            )
+                    else:
+                        self.mark_pd_hidden_request_done(
+                            kv_chunk.room,
+                            self._pd_hidden_release_state_indices(kv_chunk),
+                        )
+                if pd_hidden_deferred:
+                    kv_chunk.pd_hidden_packet_idx += 1
+                    queue.put(kv_chunk)
+                    continue
+
+                current_status = self.request_status.get(kv_chunk.room)
+                if (
+                    kv_chunk.room not in self.request_status
+                    or current_status == KVPoll.Success
+                ):
+                    if kv_chunk.room in self.transfer_infos:
+                        self.transfer_infos.pop(kv_chunk.room)
+                    self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                    if self.enable_staging:
+                        # Purge prefetch bookkeeping for the finished room.
+                        # Snapshot first: the scheduler thread adds concurrently.
+                        for key in list(self._staging_ctx.prefetch_requested):
+                            if key[0] == kv_chunk.room:
+                                self._staging_ctx.prefetch_requested.discard(key)
+                        self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
+
+                self._source_drain.complete(kv_chunk)
+
+            except Exception as e:
+                # Submission/event/allocator failure can have ambiguous side
+                # effects. Quarantine the room instead of asserting a drain.
+                if kv_chunk is not None:
+                    self._source_drain.poison(kv_chunk.room)
+                    logger.error(
+                        "Source drain is unknown for room %s; retaining resources",
+                        kv_chunk.room,
+                    )
+                    self.record_failure(kv_chunk.room, str(e))
+                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                # The failed chunk's request will be surfaced as failed by
+                # the normal transfer-failure path (update_status +
+                # sync_status_to_decode_endpoint above); do not let a
+                # single chunk kill the whole transfer thread, which
+                # would silently stall every other in-flight KV transfer
+                # on this prefill.
+                logger.exception(
+                    "transfer_worker chunk failed (bootstrap_port=%s): %s; "
+                    "continuing to next chunk",
+                    self.bootstrap_port,
+                    e,
+                )
+                continue
+
+    def start_prefill_thread(self):
+        def bootstrap_thread():
+            """This thread recvs pre-alloc notification from the decode engine"""
+            # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
+            while True:
+                waiting_req_bytes = self.server_socket.recv_multipart()
+                if waiting_req_bytes[0] == MooncakeKVManager.PD_HIDDEN_CHUNK_ACK_HEADER:
+                    room = int(waiting_req_bytes[1].decode("ascii"))
+                    prefill_rank = int(waiting_req_bytes[2].decode("ascii"))
+                    hidden_start = int(waiting_req_bytes[3].decode("ascii"))
+                    self._handle_pd_hidden_chunk_ack(
+                        room, prefill_rank, hidden_start
+                    )
+                    continue
+                room = waiting_req_bytes[0].decode("ascii")
+                # Staging: decode reports consumption watermark back to prefill
+                if room == "WATERMARK":
+                    handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+                    continue
+                # Staging: decode replies with allocated staging offset
+                if room == "STAGING_RSP":
+                    handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                    continue
+                # Decode-side abort notification: mark room as failed and ACK
+                if room == "ABORT":
+                    room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
+                    decode_ip = waiting_req_bytes[2].decode("ascii")
+                    decode_port = int(waiting_req_bytes[3].decode("ascii"))
+                    room_active = (
+                        room_to_be_aborted in self.request_status
+                        and self.check_status(room_to_be_aborted) != KVPoll.Success
+                    )
+                    if self.enable_deferred_decode_kv_release:
+                        # Mark Failed FIRST (stops add_transfer_request enqueuing
+                        # new chunks), THEN register the ack target: registering
+                        # first would let the worker drain+ack while the room is
+                        # not yet Failed, so a newly enqueued chunk could still
+                        # write to the freed pages. The worker (not this thread)
+                        # acks once its in-flight write drains; if nothing is in
+                        # flight, decode falls back to the release timeout.
+                        if room_active:
+                            self.update_status(room_to_be_aborted, KVPoll.Failed)
+                            self.register_deferred_ack_target(
+                                room_to_be_aborted, decode_ip, decode_port
+                            )
+                            # Try once: the room may already be quiescent and
+                            # never revisited by the worker.
+                            self._maybe_ack_drained_abort(room_to_be_aborted)
+                            logger.debug(
+                                f"Received abort notification for room {room_to_be_aborted}, "
+                                f"marked as Failed; ACK deferred until transfer drains"
+                            )
+                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
+                            # Concluded/unknown AND quiescent: ack now. A cleared
+                            # room is not automatically quiescent -- clear() can
+                            # drop a room whose chunk is still transferring.
+                            self._send_abort_ack(
+                                decode_ip, decode_port, room_to_be_aborted
+                            )
+                        continue
+                    # No need to abort the room if it has already succeeded
+                    if room_active:
+                        self.update_status(room_to_be_aborted, KVPoll.Failed)
+                        self._wake_pd_hidden_ack_waiters(room_to_be_aborted)
+                        logger.debug(
+                            f"Received abort notification for room {room_to_be_aborted}, "
+                            f"marked as Failed"
+                        )
+                    else:
+                        logger.debug(
+                            f"Received abort notification for room {room_to_be_aborted}, "
+                            f"ignoring (already completed or unknown)"
+                        )
+                    self._wait_pd_hidden_transfers_quiesced(room_to_be_aborted)
+                    # Send ACK back to decode endpoint
+                    try:
+                        na = NetworkAddress(decode_ip, decode_port)
+                        self._send_multipart_locked(
+                            na.to_tcp(),
+                            [
+                                b"ABORT_ACK",
+                                str(room_to_be_aborted).encode("ascii"),
+                            ],
+                            is_ipv6=na.is_ipv6,
+                        )
+                        logger.debug(
+                            f"Sent ABORT_ACK for room {room_to_be_aborted} to "
+                            f"{decode_ip}:{decode_port}"
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
+                        )
+                    continue
+                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                if room == "None":
+                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    try:
+                        self.validate_remote_state_transfer_abis(
+                            decode_kv_args.dst_state_data_formats,
+                            decode_kv_args.dst_state_item_lens,
+                        )
+                    except RuntimeError as error:
+                        decode_kv_args.registration_error = str(error)
+                        logger.error(
+                            "Decode peer %s registered an incompatible state ABI: %s",
+                            mooncake_session_id,
+                            error,
+                        )
+                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+                        decode_kv_args.dst_dcp_size,
+                        decode_kv_args.dst_dcp_rank,
+                    )
+                    if decode_kv_args.requires_dcp_relayout:
+                        decode_kv_args.dcp_token_item_lens = (
+                            self.prepare_dcp_token_item_lens(
+                                [decode_kv_args.dst_kv_item_len]
+                                * len(self.kv_args.kv_item_lens)
+                            )
+                        )
+                    self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
+                    with self.session_lock:
+                        if mooncake_session_id in self.failed_sessions:
+                            self.failed_sessions.remove(mooncake_session_id)
+                        if mooncake_session_id in self.session_failures:
+                            del self.session_failures[mooncake_session_id]
+                    logger.debug(
+                        "Registered KVArgs from %s%s",
+                        mooncake_session_id,
+                        (
+                            " with an incompatible state ABI"
+                            if decode_kv_args.registration_error is not None
+                            else " successfully"
+                        ),
+                    )
+                    continue
+                else:
+                    if len(waiting_req_bytes) < 8:
+                        logger.warning(
+                            "Ignoring malformed Mooncake bootstrap message: "
+                            "room=%s frames=%d",
+                            room,
+                            len(waiting_req_bytes),
+                        )
+                        continue
+                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
+                    room = int(room)
+                    if room not in self.transfer_infos:
+                        self.transfer_infos[room] = {}
+
+                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    self.transfer_infos[room][mooncake_session_id] = transfer_info
+                    # NOTE: after bootstrapping we can mark the req as waiting for input
+                    if len(self.transfer_infos[room]) == required_dst_info_num:
+                        self.resolve_kv_replica_factor(self.transfer_infos[room])
+                        self.req_to_decode_prefix_len[room] = next(
+                            (
+                                info.decode_prefix_len
+                                for info in self.transfer_infos[room].values()
+                                if info.decode_prefix_len is not None
+                            ),
+                            0,
+                        )
+                        pd_hidden_meta = next(
+                            (
+                                info.spec_metadata
+                                for info in self.transfer_infos[room].values()
+                                if info.spec_metadata
+                                and info.spec_metadata.get("pd_hidden")
+                            ),
+                            None,
+                        )
+                        if pd_hidden_meta:
+                            self.req_to_pd_hidden_meta[room] = pd_hidden_meta
+                        self.update_status(room, KVPoll.WaitingForInput)
+
+        threading.Thread(target=bootstrap_thread).start()
+
+    def start_decode_thread(self):
+        def decode_thread():
+            poller = zmq.Poller()
+            poller.register(self.server_socket, zmq.POLLIN)
+            poller.register(self.pd_hidden_events.ack_wakeup_receiver, zmq.POLLIN)
+            while True:
+                events = dict(poller.poll())
+                if self.pd_hidden_events.ack_wakeup_receiver in events:
+                    while True:
+                        try:
+                            self.pd_hidden_events.ack_wakeup_receiver.recv(zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
+                    self._drain_pd_hidden_ack_completions()
+                if self.server_socket not in events:
+                    continue
+                msg = self.server_socket.recv_multipart()
+                if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
+                    self._handle_aux_data(msg)
+                    continue
+                if msg[0] == MooncakeKVManager.PD_HIDDEN_CHUNK_READY_HEADER:
+                    room = int(msg[1].decode("ascii"))
+                    prefill_rank = int(msg[2].decode("ascii"))
+                    hidden_start = int(msg[3].decode("ascii"))
+                    row_len = int(msg[4].decode("ascii"))
+                    is_last_hidden_chunk = msg[5] == b"1"
+                    dst_indices = (
+                        list(np.frombuffer(msg[6], dtype=np.int32).astype(np.int64))
+                        if len(msg[6]) > 0
+                        else []
+                    )
+                    ack_host = msg[7].decode("ascii")
+                    ack_port = int(msg[8].decode("ascii"))
+                    self.pd_hidden_events.append_ready_chunk(
+                        room,
+                        {
+                            "room": room,
+                            "prefill_rank": prefill_rank,
+                            "hidden_start": hidden_start,
+                            "row_len": row_len,
+                            "is_last_hidden_chunk": is_last_hidden_chunk,
+                            "dst_indices": [int(x) for x in dst_indices],
+                            "ack_host": ack_host,
+                            "ack_port": ack_port,
+                        },
+                    )
+                    continue
+                # Staging: prefill notifies a chunk written to staging buffer
+                if msg[0] == b"CHUNK_READY":
+                    room = int(msg[1].decode("ascii"))
+                    chunk_idx = int(msg[2].decode("ascii"))
+                    page_start = int(msg[3].decode("ascii"))
+                    num_pages = int(msg[4].decode("ascii"))
+                    session_id = msg[5].decode("ascii")
+                    handler = self._staging_handler
+                    assert (
+                        handler is not None
+                    ), "CHUNK_READY received before staging handler initialized"
+                    handler.handle_chunk_arrived(
+                        room,
+                        chunk_idx,
+                        page_start,
+                        num_pages,
+                        session_id,
+                    )
+                    continue
+
+                # Staging: prefill pre-requests staging allocation before forward
+                if msg[0] == b"STAGING_REQ":
+                    self._handle_staging_req(msg)
+                    continue
+
+                # Prefill acknowledges abort notification
+                if msg[0] == b"ABORT_ACK":
+                    ack_aborted_room = int(msg[1].decode("ascii"))
+                    logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
+                    # Deferred release: the 3-frame ack carries the prefill rank
+                    # and means its transfer drained; aggregate for is_abort_release_safe.
+                    if self.enable_deferred_decode_kv_release and len(msg) >= 3:
+                        self.note_abort_ack(
+                            ack_aborted_room, int(msg[2].decode("ascii"))
+                        )
+                    continue
+
+                bootstrap_room, status, prefill_rank = msg
+                status = int(status.decode("ascii"))
+                bootstrap_room = int(bootstrap_room.decode("ascii"))
+                prefill_rank = int(prefill_rank.decode("ascii"))
+
+                if status == KVPoll.Success:
+                    if bootstrap_room in self.request_status:
+                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+                        expected_response_num = (
+                            self.required_prefill_response_num_table[bootstrap_room]
+                        )
+                        arrived_response_num = len(
+                            self.prefill_response_tracker[bootstrap_room]
+                        )
+                        if arrived_response_num == expected_response_num:
+                            if self.enable_staging:
+                                handler = self._staging_handler
+                                if handler.is_staging_room(bootstrap_room):
+                                    handler.submit_last_scatter_async(bootstrap_room)
+                            self.update_status(bootstrap_room, KVPoll.Success)
+                elif status == KVPoll.Failed:
+                    self.record_failure(
+                        bootstrap_room,
+                        "Failed to get kvcache from prefill instance, it might be dead",
+                    )
+                    self.update_status(bootstrap_room, status)
+
+        threading.Thread(target=decode_thread).start()
+        self._start_heartbeat_checker_thread()
+
+    def add_transfer_request(
+        self,
+        bootstrap_room: int,
+        kv_indices: npt.NDArray[np.int32],
+        index_slice: slice,
+        is_last_chunk: bool,
+        aux_index: Optional[int] = None,
+        state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
+        trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        source_event=None,
+        pd_hidden_start: Optional[int] = None,
+        pd_hidden_row_len: int = 0,
+        pd_hidden_is_last_chunk: bool = False,
+        pd_hidden_release_indices: Optional[List[int]] = None,
+    ):
+        assert self.disaggregation_mode == DisaggregationMode.PREFILL
+        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
+
+        if (
+            bootstrap_room not in self.request_status
+            or self.check_status(bootstrap_room) == KVPoll.Failed
+        ):
+            logger.debug(
+                "Request with bootstrap_room=%s already failed", bootstrap_room
+            )
+            return
+
+        if bootstrap_room not in self.transfer_infos:
+            # This means that the current rank is a dummy rank for this request,
+            # and it has already been marked as success, so there is no need to
+            # add further chunks into the transfer queue.
+            return
+
+        # NOTE(shangming): sharding according to the dst_infos to make sure
+        # requests with the same dst_sessions will be added into the same
+        # queue, which enables early abort with failed sessions.
+        dst_infos = self.transfer_infos[bootstrap_room].keys()
+        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
+        shard_idx = session_port_sum % len(self.transfer_queues)
+
+        if trace_ctx is None:
+            trace_ctx = TraceNullContext()
+
+        self._publish_source_chunk(
+            self.transfer_queues[shard_idx],
+            TransferKVChunk(
+                room=bootstrap_room,
+                prefill_kv_indices=kv_indices,
+                index_slice=index_slice,
+                is_last_chunk=is_last_chunk,
+                prefill_aux_index=aux_index,
+                state_indices=state_indices,
+                num_kv_tokens=num_kv_tokens,
+                source_event=source_event,
+                pd_hidden_start=pd_hidden_start,
+                pd_hidden_row_len=pd_hidden_row_len,
+                pd_hidden_is_last_chunk=pd_hidden_is_last_chunk,
+                pd_hidden_release_indices=pd_hidden_release_indices,
+                trace_ctx=trace_ctx,
+            ),
+        )
+
+    def _publish_source_chunk(self, queue, chunk):
+        self._source_drain.publish(
+            chunk,
+            queue,
+            lambda: chunk.room in self.request_status
+            and self.check_status(chunk.room) != KVPoll.Failed,
+        )
+
+    def source_transfers_drained(self, room):
+        if self.request_status.get(room) in (None, KVPoll.Failed):
+            # failure_exception() may already have removed request_status.
+            # Also covers abort racing with a worker parking after its status
+            # check. Each scheduler poll wakes any newly parked chunks.
+            self._wake_pd_hidden_ack_waiters(room)
+        return self._source_drain.drained(room)
+
+    def get_session_id(self):
+        return self.engine.get_session_id()
+
+    def _on_heartbeat_success(self, bootstrap_addr: str):
+        current_rooms = self.addr_to_rooms_tracker[bootstrap_addr].copy()
+        for bootstrap_room in current_rooms:
+            # Remove KVPoll.Success requests from the tracker
+            if bootstrap_room not in self.request_status:
+                self.addr_to_rooms_tracker[bootstrap_addr].discard(bootstrap_room)
+
+    def _run_one_probe_pass(self) -> None:
+        with self.session_lock:
+            snapshot = list(self.failed_sessions)
+        for session_id in snapshot:
+            send_probe = getattr(self.engine, "send_probe", None)
+            if send_probe is None:
+                rc = -1
+            else:
+                try:
+                    rc = send_probe(session_id)
+                except Exception as e:
+                    logger.warning("send_probe(%s) raised: %s", session_id, e)
+                    continue
+            if rc == 0:
+                with self.session_lock:
+                    was_blacklisted = session_id in self.failed_sessions
+                    self.failed_sessions.discard(session_id)
+                    self.session_failures.pop(session_id, None)
+                if was_blacklisted:
+                    logger.info(
+                        "Session %s recovered via probe; un-blacklisted",
+                        session_id,
+                    )
+                    FAILED_SESSION_RECOVERIES.inc()
+            else:
+                logger.debug("Probe still failing for %s (rc=%d)", session_id, rc)
+
+    def _failed_session_probe_loop(self) -> None:
+        logger.info(
+            "Starting failed-session probe loop (interval=%.1fs)",
+            self.failed_session_probe_interval,
+        )
+        while not self._failed_session_probe_shutdown.wait(
+            self.failed_session_probe_interval
+        ):
+            self._run_one_probe_pass()
+
+
+class MooncakeFailureExceptionMixin:
+    """Shared `failure_exception` for the Mooncake sender and receiver.
+
+    Both sides conclude a failed room identically: latch Failed, clear local
+    state, then raise with the recorded reason -- or, when no reason was
+    recorded locally, report it as propagated from another rank. Expects the
+    concrete class to provide ``conclude_state``, ``clear()``,
+    ``bootstrap_room`` and ``kv_mgr``.
+    """
+
+    def failure_exception(self):
+        # A room with no locally recorded reason failed on another rank.
+        if self.conclude_state is None:
+            self.conclude_state = KVPoll.Failed
+
+        self.clear()
+
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        is_propagated = failure_reason is None
+        if is_propagated:
+            failure_reason = "Failed due to an unknown reason from another rank"
+        raise KVTransferError(
+            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+        )
+
+
+class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
+
+    def __init__(
+        self,
+        mgr: MooncakeKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        dest_tp_ranks: List[int],
+        pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
+    ):
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            req_has_disagg_prefill_dp_rank,
+        )
+        self.conclude_state = None
+        self.init_time = time.time()
+        self._source_event = None
+        self._pd_hidden_chunk_meta = None
+        self._init_trace_ctx()
+
+    def set_source_event(self, source_event) -> None:
+        self._source_event = source_event
+
+    def set_pd_hidden_chunk_meta(
+        self,
+        hidden_start: int,
+        row_len: int,
+        is_last_hidden_chunk: bool,
+        release_indices: Optional[List[int]] = None,
+    ) -> None:
+        self._pd_hidden_chunk_meta = (
+            int(hidden_start),
+            int(row_len),
+            bool(is_last_hidden_chunk),
+            [int(x) for x in release_indices] if release_indices else None,
+        )
+
+    @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
+    def send(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
+    ):
+        kv_indices, index_slice, is_last_chunk, should_skip = (
+            self._prepare_send_indices(kv_indices, state_indices)
+        )
+        if should_skip:
+            self._source_event = None
+            return
+
+        pd_hidden_chunk_meta = self._pd_hidden_chunk_meta
+        self._pd_hidden_chunk_meta = None
+        if not is_last_chunk:
+            source_event = self._source_event
+            self._source_event = None
+            self.kv_mgr.add_transfer_request(
+                self.bootstrap_room,
+                kv_indices,
+                index_slice,
+                False,
+                num_kv_tokens=num_kv_tokens,
+                state_indices=state_indices,
+                source_event=source_event,
+                trace_ctx=self.trace_ctx.copy_for_thread(),
+                pd_hidden_start=(
+                    pd_hidden_chunk_meta[0] if pd_hidden_chunk_meta else None
+                ),
+                pd_hidden_row_len=(
+                    pd_hidden_chunk_meta[1] if pd_hidden_chunk_meta else 0
+                ),
+                pd_hidden_is_last_chunk=(
+                    pd_hidden_chunk_meta[2] if pd_hidden_chunk_meta else False
+                ),
+                pd_hidden_release_indices=(
+                    pd_hidden_chunk_meta[3] if pd_hidden_chunk_meta else None
+                ),
+            )
+        else:
+            source_event = self._source_event
+            self._source_event = None
+            self.kv_mgr.add_transfer_request(
+                self.bootstrap_room,
+                kv_indices,
+                index_slice,
+                True,
+                aux_index=self.aux_index,
+                state_indices=state_indices,
+                num_kv_tokens=num_kv_tokens,
+                source_event=source_event,
+                trace_ctx=self.trace_ctx.copy_for_thread(),
+                pd_hidden_start=(
+                    pd_hidden_chunk_meta[0] if pd_hidden_chunk_meta else None
+                ),
+                pd_hidden_row_len=(
+                    pd_hidden_chunk_meta[1] if pd_hidden_chunk_meta else 0
+                ),
+                pd_hidden_is_last_chunk=(
+                    pd_hidden_chunk_meta[2] if pd_hidden_chunk_meta else False
+                ),
+                pd_hidden_release_indices=(
+                    pd_hidden_chunk_meta[3] if pd_hidden_chunk_meta else None
+                ),
+            )
+        self._record_transfer_indices(kv_indices, state_indices)
+
+    def poll(self) -> KVPoll:
+        if self.conclude_state is None:
+            status = self.kv_mgr.check_status(self.bootstrap_room)
+            # Hold Success until all staging chunks transferred: a deferred
+            # chunk can still be pending, and concluding now would drop it.
+            if (
+                status == KVPoll.Success
+                and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+            ):
+                return KVPoll.Transferring
+            if status in (KVPoll.Success, KVPoll.Failed):
+                self.conclude_state = status
+                self.trace_ctx.trace_req_finish()
+            elif status == KVPoll.Bootstrapping:
+                timeout_result = self._check_bootstrap_timeout()
+                if timeout_result is not None:
+                    return timeout_result
+
+            return status
+        else:
+            return self.conclude_state
+
+    def _init_trace_ctx(self):
+        if self.kv_mgr.enable_trace:
+            self.trace_ctx = TraceReqContext(
+                rid=str(hex(self.bootstrap_room)),
+                bootstrap_room=self.bootstrap_room,
+                role="Sender",
+                module_name="mooncake",
+            )
+            if not self.trace_ctx.tracing_enable:
+                self.trace_ctx = TraceNullContext()
+        else:
+            self.trace_ctx = TraceNullContext()
+
+        self.trace_ctx.trace_req_start()
+
+    def is_transfer_drained(self):
+        return self.kv_mgr.source_transfers_drained(self.bootstrap_room)
+
+    def abort(self):
+        # Serialize Failed publication against the final enqueue.
+        with self.kv_mgr._source_drain.lock:
+            super().abort()
+        self.kv_mgr._wake_pd_hidden_ack_waiters(self.bootstrap_room)
+        self.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        self.trace_ctx.trace_req_finish()
+
+
+class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
+    def __init__(
+        self,
+        mgr: MooncakeKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: Optional[int] = None,
+    ):
+        self.session_id = mgr.get_session_id()
+        self.init_time = None
+        super().__init__(mgr, bootstrap_addr, bootstrap_room)
+
+    def _register_kv_args(self) -> bool:
+        for bootstrap_info in self.bootstrap_infos:
+            packed_kv_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+            )
+            packed_aux_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+            )
+            packed_state_data_ptrs = pack_int_lists(
+                self.kv_mgr.kv_args.state_data_ptrs, "Q"
+            )
+            packed_state_item_lens = pack_int_lists(
+                self.kv_mgr.kv_args.state_item_lens, "I"
+            )
+            packed_state_dim_per_tensor = pack_int_lists(
+                getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
+            )
+            packed_state_data_formats = pack_string_list(
+                getattr(self.kv_mgr.kv_args, "state_data_formats", []) or []
+            )
+            packed_state_layer_ids = pack_int_lists(
+                self.kv_mgr.kv_args.state_layer_ids, "I"
+            )
+            packed_state_types = pack_state_types(self.kv_mgr.kv_args.state_types)
+            packed_kv_layer_ids = b"".join(
+                struct.pack("I", layer_id)
+                for layer_id in self.kv_mgr.kv_args.kv_layer_ids
+            )
+            # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
+            tp_rank = self.kv_mgr.kv_args.engine_rank
+            # Some pools have no full-token contiguous KV (kv_item_lens empty)
+            # and ship per-pool instead, so report 0.
+            kv_item_len = (
+                self.kv_mgr.kv_args.kv_item_lens[0]
+                if self.kv_mgr.kv_args.kv_item_lens
+                else 0
+            )
+            dst_tp_rank = str(tp_rank).encode("ascii")
+            dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
+            dst_kv_item_len = str(kv_item_len).encode("ascii")
+            dst_dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
+            dst_dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
+            if (
+                self.kv_mgr.enable_staging
+                and self.kv_mgr._staging_ctx.allocator is not None
+            ):
+                _alloc = self.kv_mgr._staging_ctx.allocator
+                packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
+                staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
+            else:
+                packed_staging_base_ptr = b""
+                staging_total_size_str = b""
+
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            try:
+                with lock:
+                    sock.send_multipart(
+                        [
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.session_id.encode("ascii"),
+                            packed_kv_data_ptrs,
+                            packed_aux_data_ptrs,
+                            packed_state_data_ptrs,
+                            dst_tp_rank,
+                            dst_attn_tp_size,
+                            dst_kv_item_len,
+                            packed_state_item_lens,
+                            packed_state_dim_per_tensor,
+                            packed_kv_layer_ids,
+                            packed_state_layer_ids,
+                            packed_staging_base_ptr,
+                            staging_total_size_str,
+                            dst_dcp_size,
+                            dst_dcp_rank,
+                            packed_state_data_formats,
+                        ] + ([packed_state_types, encode_v4_transfer_metadata(self.kv_mgr.kv_args)]
+                             if getattr(self.kv_mgr.kv_args, "v4_transfer_metadata", None) else [])
+                    )
+            except zmq.ZMQError:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                            packed_state_types,
+                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+                )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return False
+        return True
+
+    def send_metadata(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        state_indices: Optional[List] = None,
+        decode_prefix_len: Optional[int] = None,
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        spec_metadata: Optional[dict] = None,
+    ):
+        if self.bootstrap_infos is None:
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+
+        self.chunk_staging_infos = []
+        if (
+            self.kv_mgr.enable_staging
+            and self.kv_mgr._staging_ctx.allocator is not None
+        ):
+            self.kv_mgr.register_staging_room_bootstrap(
+                self.bootstrap_room, self.bootstrap_infos, self
+            )
+
+        for bootstrap_info in self.bootstrap_infos:
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            is_dummy = bootstrap_info["is_dummy"]
+            local_state_indices = state_indices
+            local_spec_metadata = spec_metadata
+            if spec_metadata and spec_metadata.get("pp_slices"):
+                pp_rank_value = bootstrap_info.get(
+                    "target_pp_rank", bootstrap_info.get("pp_rank")
+                )
+                if pp_rank_value is None:
+                    raise RuntimeError(
+                        "PD hidden metadata requires target_pp_rank in "
+                        f"bootstrap_info, got keys={sorted(bootstrap_info.keys())}"
+                    )
+                pp_rank = int(pp_rank_value)
+                pp_slice = spec_metadata["pp_slices"].get(str(pp_rank))
+                if pp_slice is None:
+                    raise RuntimeError(
+                        "PD hidden metadata is missing slice for "
+                        f"target_pp_rank={pp_rank}, available_pp_slices="
+                        f"{sorted(spec_metadata['pp_slices'].keys())}"
+                    )
+                local_spec_metadata = {
+                    **spec_metadata,
+                    "target_pp_rank": int(pp_rank),
+                    "pp_slice": pp_slice,
+                }
+                local_state_indices = list(
+                    state_indices
+                    if state_indices is not None
+                    else [None] * len(self.kv_mgr.kv_args.state_types)
+                )
+                for idx, state_type in enumerate(self.kv_mgr.kv_args.state_types):
+                    if state_type == StateType.PD_HIDDEN:
+                        local_state_indices[idx] = pp_slice.get("dst_indices", [])
+                        break
+
+            try:
+                with lock:
+                    sock.send_multipart(
+                        [
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.session_id.encode("ascii"),
+                            kv_indices.tobytes() if not is_dummy else b"",
+                            str(aux_index).encode("ascii") if not is_dummy else b"",
+                            (
+                                pack_int_lists(local_state_indices, "i")
+                                if not is_dummy and local_state_indices
+                                else b""
+                            ),
+                            str(self.required_dst_info_num).encode("ascii"),
+                            str(decode_prefix_len or 0).encode("ascii"),
+                            (
+                                np.asarray(device_kv_indices, dtype=np.int32).tobytes()
+                                if not is_dummy and device_kv_indices is not None
+                                else b""
+                            ),
+                            (
+                                json.dumps(local_spec_metadata).encode("utf-8")
+                                if local_spec_metadata
+                                else b""
+                            ),
+                        ]
+                    )
+            except zmq.ZMQError:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+                )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
+        self.init_time = time.time()
+
+    def poll(self) -> KVPoll:
+        if self.conclude_state is not None:
+            return self.conclude_state
+
+        status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status in (KVPoll.Success, KVPoll.Failed):
+            self.conclude_state = status
+        elif status == KVPoll.WaitingForInput:
+            timeout_result = self._check_waiting_timeout()
+            if timeout_result is not None:
+                return timeout_result
+
+        return status
+
+
+class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
+    pass
