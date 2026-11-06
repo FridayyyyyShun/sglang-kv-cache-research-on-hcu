@@ -1,0 +1,20 @@
+--- a/sglang-das/python/sglang/srt/mem_cache/pool_host/mla.py
++++ b/sglang-das/python/sglang/srt/mem_cache/pool_host/mla.py
+@@ -278,7 +278,7 @@
+ 
+         if io_backend == "kernel":
+             if self.layout == "layer_first":
+-                if self.can_use_jit:
++                if self.can_use_jit and not _is_hcu:
+                     jit_transfer_hicache_one_layer_mla(
+                         cache_dst=device_pool.kv_buffer[device_layer_id],
+                         cache_src=self.kv_buffer[host_layer_id],
+@@ -296,7 +296,7 @@
+                         **hcu_layer_split_kwargs,
+                     )
+             elif self.layout == "page_first":
+-                if self.can_use_jit:
++                if self.can_use_jit and not _is_hcu:
+                     jit_transfer_hicache_one_layer_mla(
+                         cache_dst=device_pool.kv_buffer[device_layer_id],
+                         cache_src=self.data_refs[host_layer_id],

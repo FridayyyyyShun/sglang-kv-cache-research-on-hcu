@@ -1,8 +1,8 @@
-# kv-research
+﻿# kv-research
 
 围绕大模型推理 **KV Cache 优化** 的研究仓库：以「前缀复用的正确性与可归因」为地基，逐步扩展到多 P 实例间的缓存复用与路由、分层缓存（HiCache）、远端 KV 存储与传输（Mooncake），以及淘汰、容量与压缩策略。
 
-> 当前仓库内容是课题的第一阶段：Radix Tree 基础验证（T1–T6）。下文「研究路线」中的其余方向均为规划中，尚未实现。
+> 当前仓库包含 Radix Tree 基础验证、HiCache 机制实验，以及 HiCache 回载正确性与淘汰策略评估。多实例路由、远端 KV 等研究方向仍按路线逐步推进；候选验收门槛不代表已达成。
 
 ## 课题聚焦
 
@@ -81,3 +81,15 @@ bash run_m1.sh --host "$M1_HOST"
 ## 第三方源码与许可
 
 `sglang-das/` 来自 [sgl-project/sglang](https://github.com/sgl-project/sglang)，按 Apache-2.0 许可发布，许可证见 `sglang-das/LICENSE`，第三方声明见 `sglang-das/THIRD_PARTY_NOTICES.md`。本仓库的实验脚本为在此之上的研究性补充。
+## HiCache 回载正确性与淘汰策略评估
+
+新增实验目录：[experiments/hicache-restore-eviction/](experiments/hicache-restore-eviction/README.md)，与已有 `radix-tree/`、`hicache/` 并列，使用独立的启动入口和 observer，不替换原实验。
+
+| 本目录编号 | 内容 |
+|---|---|
+| T1 | GPU→Host 写穿备份提交与完成 |
+| T2 | 全 rank 的 Host→GPU 回载与 KV 指纹一致性验证 |
+| T3 | LRU、LFU、SLRU、Priority 的实际淘汰选择审计 |
+| T4 | 五种统一负载下的 GPU/Host 命中与端到端时延对比 |
+
+启动命令、运行方式及判定边界见该目录 README 和各 Python 文件头部注释。源码沿用 `sglang-das/`；HCU MLA H2D JIT 兼容差异以目录内补丁保存，需要时手动应用并重启服务。本次整合不直接改变现有 SGLang 源码。

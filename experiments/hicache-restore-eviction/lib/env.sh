@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# M1 radix-tree 实验：平台环境（NCCL/ROCm/HSA 等 tuning；已隐去具体集群节点）
+# 用法：source lib/env.sh [节点别名]
+# 说明：这里只负责"平台"，实验轴在 lib/serve.sh 里。
+#       节点 IP / 网卡请用 M1_HOST、M1_IFNAME 环境变量传入，或自行在下方添加别名。
+
+M1_NODE="${1:-${M1_NODE:-example}}"
+case "$M1_NODE" in
+  # 占位示例：192.0.2.0/24 是 RFC 5737 文档保留地址，不可路由，运行前必须替换
+  example) HOST=192.0.2.10; SOCKET_IFNAME=eth0;;
+  *) HOST=""; SOCKET_IFNAME=eth0;;
+esac
+HOST="${M1_HOST:-$HOST}"
+SOCKET_IFNAME="${M1_IFNAME:-$SOCKET_IFNAME}"
+if [[ -z "$HOST" ]]; then
+  echo "未配置节点地址：请设置 M1_HOST（必要时加 M1_IFNAME），或在 lib/env.sh 中添加节点别名" >&2
+  return 1 2>/dev/null || exit 1
+fi
+MODEL_PATH="${M1_MODEL_PATH:-/model/GLM-5.2-w4a8}"
+
+# Clean inherited experiment switches; platform settings below remain fixed.
+for key in $(compgen -e); do
+ case "$key" in SGLANG_*|SGL_*|MEGAMOE_*|K3_*|LIGHTOP_*) unset "$key";; esac
+done
+IB_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# SGLang 源码树由 serve.sh 决定（默认用仓库 python/，可用 M1_SGLANG_SRC=pkg 走 dist-packages）
+SGLANG_REPO="${M1_REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../sglang-das/python" && pwd)}"
+SGLANG_PKG=/usr/local/lib/python3.10/dist-packages
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
+export GLIBC_TUNABLES=glibc.rtld.optional_static_tls=0x40000
+export SGLANG_SET_CPU_AFFINITY=1
+export HIP_KERNEL_BATCH_CEILING=100
+export GPU_MAX_HW_QUEUES=5
+export SGLANG_USE_MODELSCOPE=1
+
+export USE_DCU_CUSTOM_ALLREDUCE=0
+export SGLANG_USE_AITER_AR=0
+
+# H2D / D2H
+export HIP_H2D_DISABLE_COPY_BUFFER=0
+export HIP_D2H_DISABLE_COPY_BUFFER=0
+export HIP_H2D_DIRECT_COPY_THRESHOLD=32768
+export HIP_H2D_HSAAPI_COPY_THRESHOLD=32768
+export HIP_D2H_DIRECT_COPY_THRESHOLD=512
+export HIP_D2H_HSAAPI_COPY_THRESHOLD=512
+
+
+# hip launch
+export HSA_KERNARG_POOL_SIZE=8388608
+export HSA_FORCE_FINE_GRAIN_PCIE=1
+export ROC_AQL_QUEUE_SIZE=131072
+
+# nccl / rccl
+export NCCL_MAX_NCHANNELS=16
+export NCCL_MIN_NCHANNELS=16
+export NCCL_IB_HCA=${IB_DEVICES}
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-${SOCKET_IFNAME}}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${SOCKET_IFNAME}}"
+
+# unset NCCL_IB_GID_INDEX
+
+# export NCCL_NET_PLUGIN=shca
+# export NCCL_PLUGIN_P2P=ib
+
+
+# mooncake
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
+export MC_TE_FILTERS="${IB_DEVICES}"
+export MC_ALLOWED_IBV_DEVICES="${IB_DEVICES}"
+# allreduce overlap
+export ALLREDUCE_STREAM_WITH_COMPUTE=1
+
+# 融合算子
+export SGLANG_USE_LIGHTOP=1
+export SGLANG_ROCM_USE_AITER_MOE=0
+export W8A8_SUPPORT_METHODS=3
+
+# graph / tuning
+export HIP_GRAPH_ACCUMULATE_DISPATCH=1
+export HIP_GRAPH_USE_CMD_CACHE=0
+
+
+####dbg
+export SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q=1
+export SGLANG_NSA_MQA_LOGITS_MEMORY_BUDGET_GB=8
+export SGLANG_NSA_FUSE_TOPK=1
+export SGLANG_KVALLOC_KERNEL=1
+export SGLANG_CREATE_EXTEND_AFTER_DECODE_SPEC_INFO=1
+export SGLANG_ASSIGN_EXTEND_CACHE_LOCS=1
+export SGLANG_ASSIGN_REQ_TO_TOKEN_POOL=1
+export SGLANG_GET_LAST_LOC=1
+export SGLANG_CREATE_FLASHMLA_KV_INDICES_TRITON=1
+export SGLANG_CREATE_CHUNKED_PREFIX_CACHE_KV_INDICES=1
+#export SGLANG_NSA_HCU_INT2_INDEX_K_CACHE=1
+### dbg
+export SGLANG_DEBUG_RADIX_CACHE_TIME=${M1_RADIX_TIME:-0}
+export SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT=120
+
+#export SGLANG_W4A8_TPMOE_BACKEND=aiter
+export SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE=0
+export SGLANG_USE_W4A8_CONTIGUOUS_HIPC=1
+
+export SGLANG_USE_DEEPGEMM_MOE=1
+
+export ROCSHMEM_ALLOWED_IBV_DEVICES="${IB_DEVICES}"
+export MC_ALLOWED_IBV_DEVICES="${IB_DEVICES}"
+#export ROCSHMEM_MAX_NUM_CONTEXTS=60
+#export ROCSHMEM_DISABLE_HDP_FLUSH=1
+#export ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX=288
+export ROCSHMEM_GDR_DISABLE_XDP=0
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
+export ROCSHMEM_IB_GID_INDEX=0
+#export DEEPEP_ENABLE_LL_LAYERED_OPT=1
+
+export MC_GID_INDEX=0
+export SGLANG_NSA_HCU_REUSE_SORTED_TOPK=1
+
+export SGLANG_OPT_USE_TOPK_V2=0
+
+# export ROCBLAS_LAYER=3
+# export FLASH_MLA_DSA_DEBUG=1
+export LIGHTOP_MQA_LOGITS_BETA_FP8=1
+
+
+export SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD=${M1_CHUNK_THRESH:-0}
