@@ -1,11 +1,11 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # T1/T2/T3/T4 测试入口：必须先手动启动服务器，本脚本不会启动、重启或停止服务。
 # T1：验证冷请求的 GPU→Host write_through 备份提交及完成。
 # 服务需 --hicache on --hc-policy write_through --obs 1，启动时设置：
 # M1_HICACHE_VERIFY=0 M1_EVICTION_VERIFY=0
 # 运行：bash run_hicache.sh --only t1 --host 127.0.0.1
 # T1默认发送1条4096-token输入，生成1个token，不验证回载或KV指纹。
-# 以下均为使用示例，注释本身不会执行；完整启动说明见 RUN_HICACHE.md。
+# 以下均为使用示例，注释本身不会执行；完整启动说明见 README.md。
 #
 # 1. T2：验证目标 KV 从 Host 回载到 GPU，且与原始 KV 指纹一致。
 #    服务需开启 HiCache、--obs 1，并在启动时设置：

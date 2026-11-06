@@ -1,4 +1,4 @@
-# HiCache 回载正确性与淘汰策略评估
+﻿# HiCache 回载正确性与淘汰策略评估
 
 本实验集聚焦于 SGLang HiCache 的 **KV 回载正确性**与 **GPU 缓存淘汰策略评估**。通过写穿备份、容量压力驱逐、Host 回载及 KV 指纹比对验证数据恢复正确性，并在统一工作负载下比较 LRU、LFU、SLRU、Priority 的命中表现和端到端请求时延。
 
@@ -127,3 +127,13 @@ T1 关联同 PID、同节点的备份提交和完成，当前不强制所有 ran
 结果写入 `.state/last_run` 对应目录，包括实验 JSON、artifacts、observer 事件和运行摘要。T4 性能结果为 `t4_policy_benchmark_<policy>.json`，详细请求和分组数据用于复核结论。重跑前归档同名结果，避免覆盖。
 
 建议在独立分支中提交本实验目录和明确说明的源码差异，保留同事原有目录。不要提交 `.state/`、运行日志、缓存或模型文件。
+## 参数与排查补充
+
+- `--cap` 对应 GPU token 池容量，`--ctx` 是单请求上下文上限，`--chunk` 是分块 prefill 预算，三者不能互相替代，也不能把 TP8 的容量直接乘八。
+- 当前 MLA/sparse 配置使用 `page_first`；不要直接套用 MHA 的其他布局。先确认服务日志显示 Host 池和 HiCache 控制器已创建。
+- 客户端和服务观测进程需要能访问同一份运行目录。修改 observer 后必须重启服务。
+- T2 每轮分别发送 1、2、3……条独立压力输入，再探测目标；通过后提前停止。探测会重新使目标变热，压力必须足以驱逐目标。单条压力输入和输出预算需能放入池，Host 容量也应足以保留目标。
+- 只有 Host 节点存在不等于备份完成，只有 Host 命中不等于回载完成。应检查提交、完成事件和对应 PID/节点。
+- 没有建立回载场景、Host 已丢失目标、缺少观测或真实回载失败，都可能导致测试不通过，需要根据 artifacts 和事件区分。
+
+T1/T2 结果分别以 `t1_hicache_write_through`、`t2_hicache_load_back` 为前缀；T3 为 `t3_eviction_policy`，T4 为 `t4_policy_benchmark_<policy>.json`。入口退出码摘要为 `run_t1_summary.txt` 至 `run_t4_summary.txt`；逐进程事件在 `radix_events_<pid>.jsonl`。
