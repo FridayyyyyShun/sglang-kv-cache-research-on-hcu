@@ -34,7 +34,7 @@
 | T5 miss 归因 | 把每次 miss 归到 cold / page_tail / salt_mismatch / capacity，不允许无法解释的 miss |
 | T6 ready / 取消 / 释放 | 锁归零、tokens = evictable + protected、物理页无泄漏、取消请求不污染缓存 |
 
-脚本见 `experiments/02-kv radix tree/`，运行方式见下文「运行」。
+脚本见 `experiments/radix-tree/`，运行方式见下文「运行」。
 
 ### 后续方向（规划中）
 
@@ -46,12 +46,13 @@
 | 成本感知淘汰 | 用成本 + 概率替换纯 LRU，在容量压力下保护高价值前缀，并给出 oracle 对照与公平性证据 | `mem_cache/evict_policy.py`、`serve.sh --policy` |
 | 容量 / 低比特 KV / 压缩 | 分层预算、低比特 KV 与增量压缩，按实测瓶颈择机展开 | `serve.sh --kv bf16\|fp8`、`--cap`、`--ctx` |
 
-以上方向都以阶段一的观测与归因方法为底座：先把「命中 / 未命中 / 重算 / 传输」的账目做清楚，再谈优化收益。新增实验将按主题放入 `experiments/` 下的独立编号目录。
+以上方向都以阶段一的观测与归因方法为底座：先把「命中 / 未命中 / 重算 / 传输」的账目做清楚，再谈优化收益。新增实验将按主题放入 `experiments/` 下的独立目录。
 
 ## 仓库结构
 
 - `sglang-das/`：SGLang 完整源码树（第三方代码，许可见文末）。实验运行时的 `PYTHONPATH` 指向 `sglang-das/python`。该目录为本地归档，可不随公开仓库发布；此时用 `M1_REPO` 指向任意一份 SGLang v0.5.18 源码树即可。
-- `experiments/02-kv radix tree/`：阶段一的启动、观测与 T1–T6 实验脚本，参见该目录的 `README.md`。
+- `experiments/radix-tree/`：阶段一的启动、观测与 T1–T6 实验脚本，参见该目录的 `README.md`。
+- `experiments/hicache/`：HiCache 分层缓存机制实验 M1–M6（L1 device / L2 host / L3 storage），沿用 `radix-tree` 的六个主题并叠加 L2/L3 状态、锁与生命周期证据；用 `lib/serve.sh` 启动，`run_m1.sh` 运行，说明见该目录的 `README.md` 与 `docs/`。
 
 ## 环境信息说明
 
@@ -68,7 +69,7 @@
 在具有 GLM-5.2-w4a8 模型、8 卡 HYGON/ROCm 环境和项目依赖的机器中：
 
 ```bash
-cd 'experiments/02-kv radix tree'
+cd experiments/radix-tree
 export M1_HOST=<目标机器 IP>
 M1_MODEL_PATH=/path/to/GLM-5.2-w4a8 bash lib/serve.sh --node example
 # 另一个终端

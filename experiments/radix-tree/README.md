@@ -13,7 +13,7 @@
 ## 运行步骤
 
 ```bash
-cd 'experiments/02-kv radix tree'
+cd experiments/radix-tree
 
 # 查看服务命令和源码路径，不启动服务
 bash lib/serve.sh --node example --mode plan
