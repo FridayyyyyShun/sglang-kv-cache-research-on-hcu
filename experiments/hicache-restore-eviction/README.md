@@ -32,6 +32,60 @@ hicache-restore-eviction/
 
 HCU MLA 回载 JIT 兼容补丁见 [应用与撤销说明](patches/README.md)。补丁仅在两处 H2D 分支判断中绕开 HCU JIT，作为报告中 Invalid address access / KERNEL VMFault 的绕行措施，不代表已经修复内核根因。保存补丁文件不会自动修改源码，应用后需要重启服务。
 
+## 启动前先应用 HCU 回载补丁
+
+操作顺序：**准备环境与源码 → 停止自己的旧测试服务 → 检查并应用补丁 → 确认源码差异 → 启动服务 → 运行 T1～T4。** 补丁只需对同一份源码应用一次，不需要每换一个实验或淘汰策略都重新应用。
+
+此补丁针对本实验报告中的 HCU MLA HiCache H2D JIT 问题。应在服务器实际运行的源码上应用；仅在本地电脑保存补丁不会改变服务器源码。非 HCU 环境无需为本问题应用此补丁。
+
+### 1. 在服务器仓库根目录应用
+
+先进入包含 `sglang-das/` 与 `experiments/` 的仓库根目录（不是实验目录，也不是 `python/`）：
+
+```bash
+cd /path/to/repository
+
+# 先检查，成功后再应用；检查失败时不要继续执行下一条。
+git apply --check experiments/hicache-restore-eviction/patches/hcu-mla-h2d-disable-jit.patch
+```
+
+上一步退出码为 0、没有报错后，再执行：
+
+```bash
+git apply experiments/hicache-restore-eviction/patches/hcu-mla-h2d-disable-jit.patch
+
+git diff -- sglang-das/python/sglang/srt/mem_cache/pool_host/mla.py
+```
+
+应看到 `load_to_device_per_layer()` 中 `layer_first`、`page_first` 两处分支从 `if self.can_use_jit:` 改成 `if self.can_use_jit and not _is_hcu:`。这会让 HCU 回载使用已有非 JIT 路径，不修改 D2H 备份判断。
+
+若检查报错，先判断源码版本是否不同或补丁是否已经应用。可执行反向检查：
+
+```bash
+git apply -R --check experiments/hicache-restore-eviction/patches/hcu-mla-h2d-disable-jit.patch
+```
+
+反向检查成功表示这两处修改已存在，不要再次应用。正向和反向检查均失败时，先核对源码差异，不强行套用。
+
+### 2. 确认启动使用打过补丁的源码
+
+进入实验目录，指定实际源码路径，再按下一节选择模式启动：
+
+```bash
+cd /path/to/repository/experiments/hicache-restore-eviction
+export M1_REPO="$(cd ../../sglang-das/python && pwd)"
+```
+
+启动参数保留 `--src repo`。先加 `--mode plan` 检查输出的 `sglang=` 是否为上述路径，再去掉 `--mode plan` 正式启动。已经运行的服务不会自动加载源码变更，必须重启。不要把补丁应用到一份源码，却通过 `M1_REPO` 启动另一份。
+
+如果使用仓库外独立的 SGLang 源码，在该源码根目录（里面直接有 `python/`）用 `git apply -p2 --check /补丁绝对路径`，检查成功后执行 `git apply -p2 /补丁绝对路径`，并将 `M1_REPO` 指向那份源码的 `python/`。
+
+### 3. 启动后验证
+
+先按 T2 模式设置 `M1_HICACHE_VERIFY=1 M1_EVICTION_VERIFY=0` 启动服务，再运行 T2，确认全 rank 回载完成且 KV 指纹一致。之后若测试 T4，按 T4 模式关闭两种额外校验并重启服务；源码补丁保留，不需要重复应用。
+
+补丁适用性检查不等于设备运行验证；实际是否解决当前机器的问题，以回载测试与服务日志为准。撤销命令见 [补丁说明](patches/README.md)。
+
 ## 启动服务器
 
 进入本实验目录，以下以 T2 为例：
