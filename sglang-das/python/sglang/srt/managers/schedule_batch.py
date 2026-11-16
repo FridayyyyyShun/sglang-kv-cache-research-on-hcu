@@ -1236,6 +1236,10 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+        # Scheduler prefill-token counter snapshot taken when this req enters the
+        # waiting queue; used by the HRRN scheduling policy as its aging axis.
+        self.arrival_processed_tokens: int = 0
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
