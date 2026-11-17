@@ -1,0 +1,124 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import unittest
+
+from sglang.srt.environ import envs
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
+
+register_hcu_ci(
+    est_time=100,
+    suite="stage-b-test-1-hcu-small",
+    disabled=(
+        "HCU PR baseline deferred: timed out after 900s on BW1100 "
+        "sgl-test stage-b-hcu partition 0; keep in nightly/manual until "
+        "radix-cache server integration is repeatable within PR budget."
+    ),
+)
+
+from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    is_in_ci,
+    kill_process_tree,
+    popen_launch_server,
+)
+
+# RadixAttention server integration tests
+register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=405, suite="base-c-test-cpu")
+
+
+class TestRadixCacheFCFS(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--chunked-prefill-size",
+                "128",
+                "--max-total-tokens",
+                "20000",
+                "--schedule-policy",
+                "fcfs",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+
+
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+class TestRadixCacheLPM(TestRadixCacheFCFS):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--chunked-prefill-size",
+                "128",
+                "--max-total-tokens",
+                "20000",
+                "--schedule-policy",
+                "lpm",
+            ],
+        )
+
+
+class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--disable-overlap-schedule",
+                "--chunked-prefill-size",
+                "128",
+                "--max-total-tokens",
+                "20000",
+                "--schedule-policy",
+                "lpm",
+            ],
+        )
+
+
+if __name__ == "__main__":
+    envs.SGLANG_TEST_RETRACT.set(True)
+    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.set(1)
+    unittest.main()

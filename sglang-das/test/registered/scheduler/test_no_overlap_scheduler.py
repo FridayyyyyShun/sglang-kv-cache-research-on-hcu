@@ -1,0 +1,65 @@
+# Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Usage:
+python3 -m unittest test_overlap_schedule.TestOverlapSchedule.test_radix_attention_chunked_prefill
+python3 test_overlap_schedule.py
+"""
+
+import unittest
+
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
+from sglang.test.test_utils import CustomTestCase, run_mmlu_test
+
+register_cuda_ci(est_time=245, stage="stage-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=275, suite="stage-b-test-1-gpu-small-amd")
+
+
+# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
+register_hcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-hcu-small",
+    disabled="HCU PR baseline deferred: scheduler path needs BW1100 repeat validation before required CI.",
+)
+
+
+class TestOverlapSchedule(CustomTestCase):
+    def test_no_radix_attention_chunked_prefill(self):
+        run_mmlu_test(
+            disable_radix_cache=True, chunked_prefill_size=32, disable_overlap=True
+        )
+
+    def test_no_radix_attention_no_chunked_prefill(self):
+        run_mmlu_test(
+            disable_radix_cache=True, chunked_prefill_size=-1, disable_overlap=True
+        )
+
+    def test_radix_attention_chunked_prefill(self):
+        run_mmlu_test(
+            disable_radix_cache=False, chunked_prefill_size=32, disable_overlap=True
+        )
+
+    def test_radix_attention_no_chunked_prefill(self):
+        run_mmlu_test(
+            disable_radix_cache=False, chunked_prefill_size=-1, disable_overlap=True
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
