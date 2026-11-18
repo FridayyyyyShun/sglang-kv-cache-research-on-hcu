@@ -327,5 +327,96 @@ class TestSchedulePolicy(CustomTestCase):
         self.assertEqual(waiting_queue[2].rid, "w3")
 
 
+class TestSchedulePolicyHrrn(CustomTestCase):
+    """HRRN: sort by response ratio = waited_tokens / uncached_tokens."""
+
+    def setUp(self):
+        self.tree_cache = RadixCache.create_simulated()
+
+    def _make_policy(self):
+        return SchedulePolicy(
+            policy="hrrn",
+            tree_cache=self.tree_cache,
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+    def test_init_with_hrrn(self):
+        self.assertEqual(self._make_policy().policy, CacheAwarePolicy.HRRN)
+
+    def test_calc_priority_hrrn_shortest_first(self):
+        """Equal wait, different service time -> shortest uncached first."""
+        r_short = _make_req("short", "a", [1])
+        r_aged = _make_req("aged", "a" * 3, [1, 2, 3])
+        r_long = _make_req("long", "a" * 10, list(range(10)))
+        waiting_queue = [r_long, r_aged, r_short]
+
+        # Empty cache -> uncached = 1 / 3 / 10, waited = 1000 for all.
+        # Ratios: 1000, 333, 100 -> short, aged, long.
+        self._make_policy().calc_priority(waiting_queue, processed_tokens=1000)
+
+        self.assertEqual([r.rid for r in waiting_queue], ["short", "aged", "long"])
+
+    def test_calc_priority_hrrn_aging_overtakes_short(self):
+        """A long request that waited long enough must beat a fresh short one."""
+        r_long_old = _make_req("long_old", "a" * 100, list(range(100)))
+        r_short_new = _make_req("short_new", "a", [1])
+        r_long_old.arrival_processed_tokens = 0
+        r_short_new.arrival_processed_tokens = 100000
+        waiting_queue = [r_short_new, r_long_old]
+
+        # long_old: 100000/100 = 1000; short_new: 0/1 = 0.
+        self._make_policy().calc_priority(waiting_queue, processed_tokens=100000)
+
+        self.assertEqual([r.rid for r in waiting_queue], ["long_old", "short_new"])
+
+    def test_calc_priority_hrrn_queue_overflow_falls_back_to_fcfs(self):
+        """Above 128 waiting reqs HRRN degrades to FCFS (no prefix matching)."""
+        waiting_queue = [_make_req("r%d" % i, "a", [1]) for i in range(129)]
+
+        self._make_policy().calc_priority(waiting_queue, processed_tokens=10)
+
+        self.assertEqual(
+            [r.rid for r in waiting_queue], ["r%d" % i for i in range(129)]
+        )
+
+    def test_sort_by_hrrn_cached_prefix_and_tiebreak(self):
+        """Cached prefix shortens uncached work; equal ratios tie-break by rid."""
+        r_more_cached = _make_req("a", "x" * 100, list(range(100)))
+        r_less_cached = _make_req("b", "x" * 100, list(range(100)))
+        r_tie = _make_req("c", "x" * 100, list(range(100)))
+        for r, matched in (
+            (r_more_cached, 90),
+            (r_less_cached, 0),
+            (r_tie, 0),
+        ):
+            r.num_matched_prefix_tokens = matched
+            r.arrival_processed_tokens = 0
+
+        waiting_queue = [r_tie, r_less_cached, r_more_cached]
+        # 10 uncached -> 100; 100 uncached -> 10 (b before c).
+        SchedulePolicy._sort_by_hrrn(waiting_queue, set(), processed_tokens=1000)
+
+        self.assertEqual([r.rid for r in waiting_queue], ["a", "b", "c"])
+
+    def test_sort_by_hrrn_fully_cached_first_and_deprioritized_last(self):
+        """Fully cached drains first, deprioritized goes last; int rids work."""
+        ready = _make_req(1, "x" * 4, [1, 2, 3, 4])
+        normal = _make_req(2, "x" * 4, [1, 2, 3, 5])
+        deprioritized = _make_req(3, "x" * 4, [1, 2, 3, 6])
+        ready.num_matched_prefix_tokens = 4
+        deprioritized.num_matched_prefix_tokens = 0
+        for r in (ready, normal, deprioritized):
+            r.arrival_processed_tokens = 0
+
+        waiting_queue = [deprioritized, normal, ready]
+        SchedulePolicy._sort_by_hrrn(
+            waiting_queue, {deprioritized.rid}, processed_tokens=100
+        )
+
+        self.assertEqual([r.rid for r in waiting_queue], [1, 2, 3])
+
+
 if __name__ == "__main__":
     unittest.main()
